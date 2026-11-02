@@ -334,6 +334,7 @@ final class Mic: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
 }
 // MARK: Whisper
 import CryptoKit   // here, not at the top: tests compile slices of this file that include this block
+import SoundAnalysis
 // Settings → Speech model → Whisper: local whisper.cpp (Homebrew whisper-server) with a downloaded ggml model, any language.
 // The mic's 16 kHz mono Float32 samples for it, filled on the mic queue and read while the key is held.
 final class WhisperAudio: @unchecked Sendable {
@@ -346,6 +347,7 @@ final class WhisperAudio: @unchecked Sendable {
     func snapshot() -> [Float] { lock.lock(); defer { lock.unlock() }; return samples }
     var seconds: Double { lock.lock(); defer { lock.unlock() }; return Double(samples.count) / 16000 }
     func take() -> [Float] { lock.lock(); defer { samples = []; lock.unlock() }; return samples }
+    func take(_ n: Int) -> [Float] { lock.lock(); defer { samples.removeFirst(min(n, samples.count)); lock.unlock() }; return Array(samples.prefix(n)) }
 }
 
 // Owns one whisper-server on a free 127.0.0.1 port. A tiny sh wrapper kills it when Atticus dies (no orphans);
@@ -519,12 +521,13 @@ final class Whisper: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
         return false
     }
 
-    func transcribe(_ pcm: [Float], prompt: String) async throws -> String {
+    func transcribe(_ pcm: [Float], prompt: String) async throws -> String { try await transcribed(pcm, prompt: prompt).text }
+    func transcribed(_ pcm: [Float], prompt: String, language: String? = nil) async throws -> (text: String, language: String?) {
         // under 0.3 s is a tap; silence gets an invented "Thank you." / "Terima kasih." from Whisper
-        guard pcm.count > 16000 * 3 / 10, pcm.contains(where: { abs($0) > 0.01 }) else { return "" }
+        guard pcm.count > 16000 * 3 / 10, pcm.contains(where: { abs($0) > 0.01 }) else { return ("", nil) }
         let (up, port) = try ensure()
         guard await up.value else { stop(); throw Failed("whisper-server didn’t start.") }   // the next try starts a fresh one
-        let boundary = "atticus-\(UUID().uuidString)", lang = Prefs.str("whisperLanguage")
+        let boundary = "atticus-\(UUID().uuidString)", lang = language ?? Prefs.str("whisperLanguage")
         var body = Data()
         func field(_ name: String, _ value: String) { body.append(Data("--\(boundary)\r\nContent-Disposition: form-data; name=\"\(name)\"\r\n\r\n\(value)\r\n".utf8)) }
         field("response_format", "verbose_json"); field("temperature", "0"); field("language", lang.isEmpty ? "auto" : lang)
@@ -542,8 +545,16 @@ final class Whisper: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
         // segments Whisper itself rates as probably not speech are its hallucinations
         let segments = json["segments"] as? [[String: Any]] ?? []
         let text = segments.isEmpty ? json["text"] as? String ?? ""
-            : segments.filter { ($0["no_speech_prob"] as? Double ?? 0) < 0.6 }.compactMap { $0["text"] as? String }.joined()
-        return text.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+            : segments.filter { ($0["no_speech_prob"] as? Double ?? 0) < 0.6 }.compactMap { $0["text"] as? String }.map { Self.withoutInvented($0) }.joined(separator: " ")
+        return (text.split(whereSeparator: \.isWhitespace).joined(separator: " "), json["detected_language"] as? String)
+    }
+    // Closing lines of the videos Whisper trained on, which it invents over noise and no_speech_prob doesn't catch. They can stick to the
+    // end of real speech with no full stop between, so the text is cut from the first one on, never dropped whole.
+    static func withoutInvented(_ text: String) -> String {
+        let phrases = ["hãy subscribe", "subscribe cho kênh", "để không bỏ lỡ những video", "không bỏ lỡ những video", "cảm ơn các bạn đã theo dõi", "hẹn gặp lại các bạn trong",
+                       "thank you for watching", "thanks for watching", "please subscribe", "subscribe to my channel", "that's it for this video", "if you enjoyed this video", "undertekster", "amara.org"]
+        let hit = phrases.compactMap { text.range(of: $0, options: [.caseInsensitive, .diacriticInsensitive]) }.map(\.lowerBound).min()
+        return hit.map { String(text[..<$0]).trimmingCharacters(in: .whitespaces) } ?? text
     }
     static func wav(_ pcm: [Float]) -> Data {   // 16 kHz mono 16-bit PCM
         var d = Data(capacity: 44 + pcm.count * 2)
@@ -555,6 +566,134 @@ final class Whisper: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
         for v in pcm { u16(UInt16(bitPattern: Int16(max(-1, min(1, v)) * 32767))) }
         return d
     }
+}
+// Meetings on Whisper: one per stream (the call, your mic). A pass takes seconds (2.8-4.2 s for Turbo on an M3), so pauses are found
+// in the audio itself, not between passes: a line closes at the last 0.7 s pause heard, however late the pass that was running ends.
+// Finals always run; live words only when the server is free, and the stream that just had a turn yields if the other has speech waiting.
+// Passes on a stream run one at a time, so lines stay in order. Three failed finals in a row report an error.
+// Whisper never says "no speech" (noise scores no_speech_prob 0 and comes back as a video's sign-off, in any language), so Apple's
+// sound classifier decides first: noise, keys and hum score under 0.04, voices over 0.8, in about 60 ms. The previous line isn't sent as a prompt.
+// On Auto, one meeting's language locks once two long lines agree: both streams share a MeetingLanguage.
+final class MeetingLanguage: @unchecked Sendable {   // main thread only
+    private(set) var pinned: String?
+    private var seen: String?
+    func note(_ language: String?, seconds: Double) {
+        guard pinned == nil, let language, seconds >= 3 else { return }
+        if seen == language { pinned = language } else { seen = language }
+    }
+    var request: String? { ["", "auto"].contains(Prefs.str("whisperLanguage")) ? pinned : nil }
+}
+private final class SpeechScore: NSObject, SNResultsObserving {
+    var best = 0.0
+    func request(_ r: SNRequest, didProduce x: SNResult) { best = max(best, (x as? SNClassificationResult)?.classification(forIdentifier: "speech")?.confidence ?? 0) }
+}
+final class MeetingWhisper: @unchecked Sendable {   // touched on the main thread only
+    let audio = WhisperAudio()
+    nonisolated(unsafe) private static var running = 0, freed = Date.distantPast   // passes in flight, both streams; when the last ended
+    nonisolated(unsafe) private static weak var lastLive: MeetingWhisper?
+    private let hints: String, heard: (String, Bool) -> Void, failed: (String) -> Void, language: MeetingLanguage
+    private var busy = false, ask = 0, sent = 0, asked = Date.distantPast, fails = 0, seen = 0, grew = Date()
+    private var recent: [(text: String, at: Date)] = []
+    init(hints: String, language: MeetingLanguage = MeetingLanguage(), heard: @escaping (String, Bool) -> Void, failed: @escaping (String) -> Void) { self.hints = hints; self.language = language; self.heard = heard; self.failed = failed }
+    static func isSpeech(_ pcm: [Float]) -> Bool {   // anything under its 1 s window is too short to trust; a broken classifier lets audio through
+        guard let format = AVAudioFormat(standardFormatWithSampleRate: 16000, channels: 1), let request = try? SNClassifySoundRequest(classifierIdentifier: .version1),
+              let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(pcm.count)), !pcm.isEmpty else { return true }
+        buffer.frameLength = AVAudioFrameCount(pcm.count); pcm.withUnsafeBufferPointer { buffer.floatChannelData![0].update(from: $0.baseAddress!, count: pcm.count) }
+        request.windowDuration = CMTime(seconds: 1, preferredTimescale: 1000); request.overlapFactor = 0.5
+        let analyzer = SNAudioStreamAnalyzer(format: format), score = SpeechScore()
+        guard (try? analyzer.add(request, withObserver: score)) != nil else { return true }
+        analyzer.analyze(buffer, atAudioFramePosition: 0); analyzer.completeAnalysis()
+        return score.best >= 0.3
+    }
+    // Sentence by sentence: cuts Whisper's invented sign-offs and drops sentences of 4+ words it just gave (a minute's memory, kept alive by each repeat).
+    func clean(_ text: String, at now: Date = Date(), remember: Bool = true) -> String {
+        recent.removeAll { now.timeIntervalSince($0.at) > 60 }
+        var kept: [String] = []
+        for match in text.matches(of: try! Regex(#".+?(?:[.!?…]+(?=\s|$)|$)"#)) {   // a dot inside "1.5" or "config.json" doesn't end a sentence
+            let sentence = Self.unrepeated(Whisper.withoutInvented(text[match.range].trimmingCharacters(in: .whitespaces)))
+            let words = sentence.lowercased().split(whereSeparator: { !$0.isLetter && !$0.isNumber }), key = words.joined(separator: " ")
+            if sentence.isEmpty { continue }
+            if words.count >= 4 {
+                if let i = recent.firstIndex(where: { $0.text.contains(key) }) { if remember { recent[i].at = now }; continue }
+                if remember { recent.append((key, now)) }
+            }
+            kept.append(sentence)
+        }
+        return kept.joined(separator: " ")
+    }
+    private static func unrepeated(_ sentence: String) -> String {   // "a b c d rồi a b c d" says it once; at most one word between
+        var words = sentence.split(separator: " ").map(String.init), n = words.count / 2
+        let key = { (w: String) in w.lowercased().filter { $0.isLetter || $0.isNumber } }
+        while n >= 4 {
+            var i = 0, found = false
+            while !found, i + 2 * n <= words.count {
+                for gap in 0...1 where i + 2 * n + gap <= words.count && (0..<n).allSatisfy({ key(words[i + $0]) == key(words[i + n + gap + $0]) }) {
+                    words.removeSubrange((i + n)..<(i + 2 * n + gap)); found = true; break
+                }
+                i += 1
+            }
+            if !found { n -= 1 } else { n = min(n, words.count / 2) }
+        }
+        return words.joined(separator: " ")
+    }
+    private static let frame = 320   // 20 ms; a frame is loud when any sample passes 0.02
+    private static func loud(_ pcm: ArraySlice<Float>) -> Bool { pcm.contains { abs($0) > 0.02 } }
+    static func hasSpeech(_ pcm: [Float]) -> Bool {   // a quarter second of loud frames: not a key click, not room noise
+        var count = 0, i = 0
+        while i < pcm.count { if loud(pcm[i..<min(pcm.count, i + frame)]) { count += 1; if count >= 12 { return true } }; i += frame }
+        return false
+    }
+    // Where to close: the end of the last pause of at least 0.7 s, and whether anything before it was speech.
+    static func cut(_ pcm: [Float]) -> (end: Int, speech: Bool)? {
+        var i = 0, run = 0, end: Int?
+        while i + frame <= pcm.count {
+            if loud(pcm[i..<(i + frame)]) { run = 0 } else { run += 1; if run >= 35 { end = i + frame } }
+            i += frame
+        }
+        return end.map { ($0, hasSpeech(Array(pcm[..<$0]))) }
+    }
+    func tick() {   // main thread, every 0.25 s
+        let pcm = audio.snapshot(), now = Date()
+        if pcm.count != seen { seen = pcm.count; grew = now }
+        guard !busy, !pcm.isEmpty else { return }
+        if let c = Self.cut(pcm) { return close(c.end, speech: c.speech) }
+        // capture can simply stop sending when an app goes quiet, or a line can run long: close what's here
+        if now.timeIntervalSince(grew) >= 0.7 || pcm.count >= 30 * 16000 { return close(pcm.count, speech: Self.hasSpeech(pcm)) }
+        guard Self.running == 0, Self.lastLive !== self || now.timeIntervalSince(Self.freed) >= 0.3, pcm.count - sent >= 8000, now.timeIntervalSince(asked) >= 1, Self.hasSpeech(Array(pcm[max(0, sent - 4000)...])) else { return }
+        ask += 1; let n = ask, hints = hints, lang = language.request; busy = true; asked = now; sent = pcm.count; Self.running += 1; Self.lastLive = self
+        Task { [weak self] in
+            let r = Self.isSpeech(pcm) ? try? await Whisper.shared.transcribed(pcm, prompt: hints, language: lang) : nil   // a failed live pass only skips a beat
+            await MainActor.run {
+                Self.running -= 1; Self.freed = Date()
+                guard let self, self.ask == n else { return }
+                self.busy = false
+                if let r { let text = self.clean(r.text, remember: false); if !text.isEmpty { self.heard(text, false) } }
+            }
+        }
+    }
+    private func close(_ end: Int, speech: Bool) {
+        let pcm = audio.take(end), hints = hints, lang = language.request
+        ask += 1; sent = 0; seen = audio.snapshot().count
+        guard speech else { return }   // silence or noise: Whisper would only invent words for it
+        let n = ask; busy = true; Self.running += 1
+        Task { [weak self] in
+            let r: Result<(text: String, language: String?), Error>
+            do { r = .success(Self.isSpeech(pcm) ? try await Whisper.shared.transcribed(pcm, prompt: hints, language: lang) : ("", nil)) } catch { r = .failure(error) }
+            await MainActor.run {
+                Self.running -= 1; Self.freed = Date()
+                guard let self, self.ask == n else { return }
+                self.busy = false
+                switch r {
+                case .success(let got):
+                    let text = self.clean(got.text); self.fails = 0
+                    if !text.isEmpty { self.language.note(got.language, seconds: Double(pcm.count) / 16000) }
+                    self.heard(text, true)
+                case .failure(let e): self.fails += 1; if self.fails >= 3 { self.failed(e.localizedDescription) }
+                }
+            }
+        }
+    }
+    func reset() { audio.reset(); ask += 1; busy = false; sent = 0; seen = 0 }   // drops what's buffered and any pass still running
 }
 // MARK: end Whisper
 func microphoneChoices() -> [[String: String]] { microphones().map { ["uid": $0.uid, "name": $0.name] } }
@@ -5592,29 +5731,31 @@ final class MeetingAudio: NSObject, SCStreamOutput, SCStreamDelegate {
     var stream: SCStream?, feed: AsyncStream<AnalyzerInput>.Continuation?, micFeed: AsyncStream<AnalyzerInput>.Continuation?
     var format: AVAudioFormat?, converter: AVAudioConverter?, natural: AVAudioFormat?
     var micConverter: AVAudioConverter?, micNatural: AVAudioFormat?
+    var pcm: ((AVAudioPCMBuffer) -> Void)?, micPcm: ((AVAudioPCMBuffer) -> Void)?   // Whisper: raw 16 kHz mono buffers instead of the feeds
     var onError: ((Error) -> Void)?, onLevel: ((Float) -> Void)?
     var levelAt = Date.distantPast, level: Float = 0, micLevel: Float = 0
     var samples = 0, peak: Float = 0
     let queue = DispatchQueue(label: "meeting.audio")
     func start(_ format: AVAudioFormat?, _ feed: AsyncStream<AnalyzerInput>.Continuation?, _ micFeed: AsyncStream<AnalyzerInput>.Continuation?, microphoneID: String? = nil) async throws {
         self.format = format; self.feed = feed; self.micFeed = micFeed
+        let hearMic = micFeed != nil || micPcm != nil
         let all = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
         guard let display = all.displays.first else { throw NSError(domain: "Meeting", code: 1) }
         let cfg = SCStreamConfiguration()
-        cfg.capturesAudio = true; cfg.excludesCurrentProcessAudio = true; cfg.captureMicrophone = micFeed != nil
-        if micFeed != nil { cfg.microphoneCaptureDeviceID = microphoneID }
+        cfg.capturesAudio = true; cfg.excludesCurrentProcessAudio = true; cfg.captureMicrophone = hearMic
+        if hearMic { cfg.microphoneCaptureDeviceID = microphoneID }
         cfg.sampleRate = 48000; cfg.channelCount = 2
         cfg.width = 2; cfg.height = 2; cfg.minimumFrameInterval = CMTime(value: 1, timescale: 1); cfg.showsCursor = false
         let s = SCStream(filter: SCContentFilter(display: display, excludingWindows: []), configuration: cfg, delegate: self)
         stream = s
         try s.addStreamOutput(self, type: .audio, sampleHandlerQueue: queue)
-        if micFeed != nil { try s.addStreamOutput(self, type: .microphone, sampleHandlerQueue: queue) }
+        if hearMic { try s.addStreamOutput(self, type: .microphone, sampleHandlerQueue: queue) }
         try await s.startCapture()
     }
     func stop() async {
         let s = stream; stream = nil
         try? await s?.stopCapture()
-        queue.sync { feed?.finish(); micFeed?.finish(); feed = nil; micFeed = nil; converter = nil; natural = nil; micConverter = nil; micNatural = nil }
+        queue.sync { feed?.finish(); micFeed?.finish(); feed = nil; micFeed = nil; pcm = nil; micPcm = nil; converter = nil; natural = nil; micConverter = nil; micNatural = nil }
     }
     func stream(_ stream: SCStream, didStopWithError error: Error) { onError?(error) }
     func stream(_ stream: SCStream, didOutputSampleBuffer sample: CMSampleBuffer, of type: SCStreamOutputType) {
@@ -5630,19 +5771,21 @@ final class MeetingAudio: NSObject, SCStreamOutput, SCStreamDelegate {
         peak = max(peak, amplitude); level = max(level * 0.75, amplitude); if type == .microphone { micLevel = max(micLevel * 0.75, amplitude) }
         if Date().timeIntervalSince(levelAt) >= 0.1 { levelAt = Date(); onLevel?(level) }
         let mic = type == .microphone
-        guard let feed = mic ? micFeed : feed else { return }
+        let feed = mic ? micFeed : feed, raw = mic ? micPcm : pcm
+        guard feed != nil || raw != nil else { return }
+        let yield = { (b: AVAudioPCMBuffer) in if let raw { raw(b) } else { feed?.yield(AnalyzerInput(buffer: b)) } }   // AnalyzerInput traps on a plain 16 kHz Float32 buffer
         let want = format ?? source
         if mic {
             if source != micNatural { micNatural = source; micConverter = source == want ? nil : AVAudioConverter(from: source, to: want) }
         } else if source != natural { natural = source; converter = source == want ? nil : AVAudioConverter(from: source, to: want) }
         let converter = mic ? micConverter : converter
-        if source == want { feed.yield(AnalyzerInput(buffer: buffer)); return }
+        if source == want { yield(buffer); return }
         guard let converter, let out = AVAudioPCMBuffer(pcmFormat: want, frameCapacity: AVAudioFrameCount(Double(buffer.frameLength) * want.sampleRate / source.sampleRate) + 1) else { return }
         var given = false, error: NSError?
         converter.convert(to: out, error: &error) { _, status in
             if given { status.pointee = .noDataNow; return nil }; given = true; status.pointee = .haveData; return buffer
         }
-        if error == nil && out.frameLength > 0 { feed.yield(AnalyzerInput(buffer: out)) }
+        if error == nil && out.frameLength > 0 { yield(out) }
     }
 }
 
@@ -5782,6 +5925,7 @@ func meetingCalendarContext(_ done: @escaping ([String: Any]?, String?) -> Void)
 final class MeetingCopilot: NSObject, WKScriptMessageHandler {
     var panel: KeyPanel?, web: WKWebView?, audio: MeetingAudio?, analyzer: SpeechAnalyzer?, reading: Task<Void, Never>?, starting: Task<Void, Never>?
     var micAnalyzer: SpeechAnalyzer?, micReading: Task<Void, Never>?, analyzing: Task<Void, Never>?, micAnalyzing: Task<Void, Never>?, stopping: Task<Void, Never>?
+    var callWhisper: MeetingWhisper?, micWhisper: MeetingWhisper?, whisperTimer: Timer?
     var micPending = "", micPartial = "", micSettle: DispatchWorkItem?, elapsed: TimeInterval = 0
     var partialQuestion: Int?, micPartialQuestion: Int?
     var voice = false, voiceText = "", voicePartial = "", voiceTail = Date.distantPast   // talking to Atticus: your mic goes to the ask box, not the transcript
@@ -5994,42 +6138,18 @@ final class MeetingCopilot: NSObject, WKScriptMessageHandler {
                 let micAllowed = demo ? true : await AVCaptureDevice.requestAccess(for: .audio)
                 guard running, generation == g, !Task.isCancelled else { return }
                 guard micAllowed else { stop(); js("error", "Allow Microphone access for Atticus in System Settings"); return }
-                let mic = SpeechTranscriber(locale: Locale(identifier: "en-US"), preset: .progressiveTranscription)
-                let tr = SpeechTranscriber(locale: Locale(identifier: "en-US"), preset: .progressiveTranscription)
-                if let request = try await AssetInventory.assetInstallationRequest(supporting: [tr]) { try await request.downloadAndInstall() }
-                guard let format = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [tr]) else {
-                    if running && generation == g { stop(); js("error", "Speech recognition is unavailable. Resume to try again.") }; return
-                }
-                guard running, generation == g, !Task.isCancelled else { return }
-                let (stream, feed) = AsyncStream<AnalyzerInput>.makeStream()
-                let (micStream, micFeed) = AsyncStream<AnalyzerInput>.makeStream()
-                let an = SpeechAnalyzer(modules: [tr]); analyzer = an
-                let micAn = SpeechAnalyzer(modules: [mic]); micAnalyzer = micAn
-                let context = AnalysisContext(); context.contextualStrings[.general] = [name, "Atticus"].filter { !$0.isEmpty }
-                try await an.setContext(context)
-                try await micAn.setContext(context)
-                guard running, generation == g, !Task.isCancelled else { return }
-                reading = Task { [weak self] in
-                    do { for try await result in tr.results {
-                        let piece = String(result.text.characters)
-                        await MainActor.run { if self?.generation == g && self?.running == true { self?.speech(piece, final: result.isFinal) } }
-                    } } catch { await MainActor.run { if self?.running == true && self?.generation == g { self?.stop(); self?.js("error", "Speech stopped") } } }
-                }
-                micReading = Task { [weak self] in
-                    do { for try await result in mic.results {
-                        let piece = String(result.text.characters)
-                        await MainActor.run { if self?.generation == g && self?.running == true { self?.speech(piece, final: result.isFinal, mic: true) } }
-                    } } catch { await MainActor.run { if self?.running == true && self?.generation == g { self?.stop(); self?.js("error", "Microphone transcription stopped. Resume to try again.") } } }
-                }
-                analyzing = Task { [weak self] in
-                    do { try await an.start(inputSequence: stream) }
-                    catch { if self?.generation == g && self?.running == true { self?.stop(); self?.js("error", "Call transcription stopped. Resume to try again.") } }
-                }
-                micAnalyzing = Task { [weak self] in
-                    do { try await micAn.start(inputSequence: micStream) }
-                    catch { if self?.generation == g && self?.running == true { self?.stop(); self?.js("error", "Microphone transcription stopped. Resume to try again.") } }
+                let whisper = Prefs.str("speechModel") == "whisper"   // Apple's meeting model hears only English; Whisper any language
+                var format = AVAudioFormat(standardFormatWithSampleRate: 16000, channels: 1)
+                var feed: AsyncStream<AnalyzerInput>.Continuation?, micFeed: AsyncStream<AnalyzerInput>.Continuation?
+                if whisper {
+                    guard Whisper.shared.ready else { stop(); js("error", "Whisper isn’t set up yet. Open Settings → General to download a model."); return }
+                    Whisper.shared.warm(); startWhisper(g)
+                } else {
+                    guard let speech = try await startSpeech(g) else { return }
+                    format = speech.0; feed = speech.1; micFeed = speech.2
                 }
                 let capture = MeetingAudio(); audio = capture
+                if whisper { let call = callWhisper, mine = micWhisper; capture.pcm = { call?.audio.append($0) }; capture.micPcm = demo ? nil : { mine?.audio.append($0) } }
                 capture.onLevel = { [weak self, weak capture] level in let mine = capture?.micLevel ?? 0; DispatchQueue.main.async { [weak self] in
                     guard let self, generation == g, running else { return }
                     if voice { js("level", mine) } else if minimized { js("level", level) }   // voice waves follow only your mic
@@ -6050,6 +6170,54 @@ final class MeetingCopilot: NSObject, WKScriptMessageHandler {
                             ["kind": "checkpoint", "duration": seconds]])
             }
         }
+    }
+    // Apple's SpeechTranscriber on both streams (English); nil when the meeting stopped or speech is unavailable.
+    @MainActor func startSpeech(_ g: Int) async throws -> (AVAudioFormat, AsyncStream<AnalyzerInput>.Continuation, AsyncStream<AnalyzerInput>.Continuation)? {
+        let mic = SpeechTranscriber(locale: Locale(identifier: "en-US"), preset: .progressiveTranscription)
+        let tr = SpeechTranscriber(locale: Locale(identifier: "en-US"), preset: .progressiveTranscription)
+        if let request = try await AssetInventory.assetInstallationRequest(supporting: [tr]) { try await request.downloadAndInstall() }
+        guard let format = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [tr]) else {
+            if running && generation == g { stop(); js("error", "Speech recognition is unavailable. Resume to try again.") }; return nil
+        }
+        guard running, generation == g, !Task.isCancelled else { return nil }
+        let (stream, feed) = AsyncStream<AnalyzerInput>.makeStream()
+        let (micStream, micFeed) = AsyncStream<AnalyzerInput>.makeStream()
+        let an = SpeechAnalyzer(modules: [tr]); analyzer = an
+        let micAn = SpeechAnalyzer(modules: [mic]); micAnalyzer = micAn
+        let context = AnalysisContext(); context.contextualStrings[.general] = [name, "Atticus"].filter { !$0.isEmpty }
+        try await an.setContext(context)
+        try await micAn.setContext(context)
+        guard running, generation == g, !Task.isCancelled else { return nil }
+        reading = Task { [weak self] in
+            do { for try await result in tr.results {
+                let piece = String(result.text.characters)
+                await MainActor.run { if self?.generation == g && self?.running == true { self?.speech(piece, final: result.isFinal) } }
+            } } catch { await MainActor.run { if self?.running == true && self?.generation == g { self?.stop(); self?.js("error", "Speech stopped") } } }
+        }
+        micReading = Task { [weak self] in
+            do { for try await result in mic.results {
+                let piece = String(result.text.characters)
+                await MainActor.run { if self?.generation == g && self?.running == true { self?.speech(piece, final: result.isFinal, mic: true) } }
+            } } catch { await MainActor.run { if self?.running == true && self?.generation == g { self?.stop(); self?.js("error", "Microphone transcription stopped. Resume to try again.") } } }
+        }
+        analyzing = Task { [weak self] in
+            do { try await an.start(inputSequence: stream) }
+            catch { if self?.generation == g && self?.running == true { self?.stop(); self?.js("error", "Call transcription stopped. Resume to try again.") } }
+        }
+        micAnalyzing = Task { [weak self] in
+            do { try await micAn.start(inputSequence: micStream) }
+            catch { if self?.generation == g && self?.running == true { self?.stop(); self?.js("error", "Microphone transcription stopped. Resume to try again.") } }
+        }
+        return (format, feed, micFeed)
+    }
+    // Settings → Speech model → Whisper: both streams go to the local whisper-server, in the language picked there.
+    func startWhisper(_ g: Int) {
+        let hints = [meetingTitle, name].filter { !$0.isEmpty }.joined(separator: ", ")
+        let lost = { [weak self] (why: String) in if self?.generation == g && self?.running == true { self?.stop(); self?.js("error", "Whisper stopped: \(why) Resume to try again.") } }
+        let language = MeetingLanguage()
+        callWhisper = MeetingWhisper(hints: hints, language: language, heard: { [weak self] text, final in if self?.generation == g { self?.speech(text, final: final) } }, failed: lost)
+        micWhisper = MeetingWhisper(hints: hints, language: language, heard: { [weak self] text, final in if self?.generation == g { self?.speech(text, final: final, mic: true) } }, failed: lost)
+        whisperTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in self?.callWhisper?.tick(); self?.micWhisper?.tick() }
     }
     func speech(_ piece: String, final: Bool, mic: Bool = false) {
         guard running else { return }
@@ -6293,6 +6461,7 @@ final class MeetingCopilot: NSObject, WKScriptMessageHandler {
         pending += " " + partial; partial = ""; micPending += " " + micPartial; micPartial = ""
         flush(answer: false); flush(answer: false, mic: true); elapsed = Date().timeIntervalSince(began); running = false; minimized = false; generation += 1; starting?.cancel(); starting = nil; settle?.cancel(); micSettle?.cancel(); timer?.invalidate(); timer = nil
         cancelWork(); reading?.cancel(); reading = nil; micReading?.cancel(); micReading = nil
+        whisperTimer?.invalidate(); whisperTimer = nil; callWhisper = nil; micWhisper = nil
         analyzing?.cancel(); analyzing = nil; micAnalyzing?.cancel(); micAnalyzing = nil
         let capture = audio, an = analyzer, micAn = micAnalyzer; audio = nil; analyzer = nil; micAnalyzer = nil
         stopping = Task { await capture?.stop(); await an?.cancelAndFinishNow(); await micAn?.cancelAndFinishNow() }
@@ -6369,9 +6538,9 @@ final class MeetingCopilot: NSObject, WKScriptMessageHandler {
         case "voice":
             guard running else { return }
             if b["on"] as? Bool == true {
-                guard micAnalyzer != nil, !demo else { js("voiceEnd"); js("error", "Voice asks need the microphone"); return }
-                micPending += " " + micPartial; micPartial = ""; flush(answer: false, mic: true); voice = true; voiceText = ""; voicePartial = ""
-            } else if voice { voice = false; voiceText = ""; voicePartial = ""; voiceTail = Date().addingTimeInterval(1.5) }
+                guard micAnalyzer != nil || micWhisper != nil, !demo else { js("voiceEnd"); js("error", "Voice asks need the microphone"); return }
+                micPending += " " + micPartial; micPartial = ""; flush(answer: false, mic: true); voice = true; voiceText = ""; voicePartial = ""; micWhisper?.reset()
+            } else if voice { voice = false; voiceText = ""; voicePartial = ""; voiceTail = Date().addingTimeInterval(1.5); micWhisper?.reset() }
         case "pause": stop(paused: true)
         case "resume": start(brief)
         case "meetings": settings.open(tab: "meetings")
