@@ -1,6 +1,6 @@
 #!/bin/bash
 # Atticus installer. Paste in Terminal:
-#   curl -fsSL https://raw.githubusercontent.com/SaarthurR/atticus-mac/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/kms-sonnguyen/atticus-mac/main/install.sh | bash
 # Downloads the source to ~/.atticus (Atticus updates itself from there), builds the app, opens it.
 set -e
 DIR="${ATTICUS_DIR:-$HOME/.atticus}"
@@ -15,7 +15,7 @@ fi
 if [ -d "$DIR/.git" ]; then
   git -C "$DIR" pull -q --ff-only || { echo "Could not update $DIR. Delete that folder, then paste the install line again."; exit 1; }
 else
-  git clone -q --depth 1 https://github.com/SaarthurR/atticus-mac.git "$DIR"
+  git clone -q --depth 1 https://github.com/kms-sonnguyen/atticus-mac.git "$DIR"
 fi
 "$DIR/build.sh"
 open "$HOME/Applications/Atticus.app"

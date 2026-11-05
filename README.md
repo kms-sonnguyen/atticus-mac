@@ -11,10 +11,12 @@
   <b>🧠 Learns as you use it</b> &nbsp;·&nbsp; <b>⚡ Fast</b> &nbsp;·&nbsp; <b>🔑 No API key</b> &nbsp;·&nbsp; <b>Free and open source</b>
 </p>
 
+> **This is a fork** of [SaarthurR/atticus-mac](https://github.com/SaarthurR/atticus-mac) that adds Vietnamese meeting transcription (via Whisper). The install line below installs this fork and keeps it updated from here.
+
 ## Quick install
 
 ```
-curl -fsSL https://raw.githubusercontent.com/SaarthurR/atticus-mac/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/kms-sonnguyen/atticus-mac/main/install.sh | bash
 ```
 
 Needs macOS 26 and an AI client: Claude Code on a Claude plan, Devin, Pi or a local model. [Full install steps](#install)
@@ -179,7 +181,7 @@ You need:
 Paste this in Terminal:
 
 ```
-curl -fsSL https://raw.githubusercontent.com/SaarthurR/atticus-mac/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/kms-sonnguyen/atticus-mac/main/install.sh | bash
 ```
 
 It checks your Mac, downloads Atticus to `~/.atticus`, builds `~/Applications/Atticus.app`, and opens it. Atticus starts at login and updates itself from there (turn that off in Settings → About & Updates).
@@ -189,10 +191,10 @@ It checks your Mac, downloads Atticus to `~/.atticus`, builds `~/Applications/At
 On macOS with Nix flakes enabled:
 
 ```bash
-nix run github:SaarthurR/atticus-mac
+nix run github:kms-sonnguyen/atticus-mac
 ```
 
-The flake installs its packaged Atticus version, so macOS 26+ and Apple's command line tools are still required. Run that command again to update. `nix profile add github:SaarthurR/atticus-mac` installs an `atticus` launcher; update it with `nix profile upgrade atticus`, then run `atticus`. Nix installations show this update path in Settings instead of using Atticus's Git updater.
+The flake installs its packaged Atticus version, so macOS 26+ and Apple's command line tools are still required. Run that command again to update. `nix profile add github:kms-sonnguyen/atticus-mac` installs an `atticus` launcher; update it with `nix profile upgrade atticus`, then run `atticus`. Nix installations show this update path in Settings instead of using Atticus's Git updater.
 
 Working on the code instead? Clone the repo anywhere and run `./build.sh` after each change. A Devbox environment is included for Python regression tests; run `devbox shell`, then `devbox run test`.
 
