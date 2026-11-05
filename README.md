@@ -26,7 +26,7 @@ Needs macOS 26 and an AI client: Claude Code on a Claude plan, Devin, Pi or a lo
 - **Sees your screen.** Ask about anything on screen. Ask "where do I click?" and it points at the spot.
 - **Draws to explain.** "Explain this and draw it" builds a labeled diagram on your screen.
 - **Dictate anywhere.** Hold fn, talk, let go. Your words land in any text field, cleaned up.
-- **Hands-free.** Turn on Settings → General → Wake word, then just say "Atticus". Keep talking after each answer; the box stays up while you work and only ✕ closes it.
+- **Hands-free.** Turn on Settings → General → Wake word, then just say "Atticus" (or any wake word you pick). Keep talking after each answer; the box stays up while you work and only ✕ closes it.
 - **Background agents.** Big jobs run behind your apps while you keep working.
 - **Meeting Copilot.** Answers and notes during calls, saved on your Mac.
 - **Remembers you.** Say "remember…" and every ask after that knows it.
@@ -70,7 +70,7 @@ https://github.com/user-attachments/assets/26822ad2-6281-477d-b676-2f490a4a207b
 
 ## Hands-free
 
-Turn on **Wake word: say "Atticus"** in Settings → General (off by default). Say "Atticus" or "hey Atticus", wait for Listening…, then ask. Speech is recognized on your Mac only. After each answer it listens again quietly, with a small "Listening..." beside the timer; start talking and your words fill the bubble. Clicking other apps never closes a hands-free chat, so you can keep working while it does things for you. ✕ or Esc ends it, and a chat nobody talks to fades after about 90 seconds unless you moved or resized the box. The hotkey always takes over. While the wake word is on, macOS shows the orange mic dot.
+Turn on **Wake word** in Settings → General (off by default). The word is "Atticus" unless you type your own beside the switch. Say it, with or without "hey" first, wait for Listening…, then ask. Speech is recognized on your Mac only. After each answer it listens again quietly, with a small "Listening..." beside the timer; start talking and your words fill the bubble. Clicking other apps never closes a hands-free chat, so you can keep working while it does things for you. ✕ or Esc ends it, and a chat nobody talks to fades after about 90 seconds unless you moved or resized the box. The hotkey always takes over. While the wake word is on, macOS shows the orange mic dot.
 
 While Atticus works, the line next to ✕ minimizes the box to a small bar with its live steps. Hover and click the line to bring it back.
 
@@ -106,7 +106,7 @@ This is how you show Atticus something; [Draw on screen](#draw-on-screen) is how
 
 Ask where to click or how to do something and Atticus shows you instead of only telling you: it draws boxes, circles, arrows and labels over your screen, with a pointer that moves to each spot. It goes one step at a time and moves on when you click the highlighted spot, change that value, or say "next".
 
-Ask it to explain something and draw it ("explain the Pythagorean theorem and draw it on my screen") and the drawing builds up like a whiteboard: each step adds to the last, and a card in the opposite corner keeps every caption so far. It moves through the steps by itself. It works from what you have open: with a video, page or problem on screen, it marks up that figure and uses its numbers, unless you ask for a fresh example. Drawings go on the screen where you asked (the one with the Atticus box) unless you name another. Worked examples and practice problems are written line by line in large text on one panel, readable from your chair on a laptop or a monitor.
+Ask it to explain something and draw it ("explain the Pythagorean theorem and draw it on my screen") and the drawing builds up like a whiteboard: each step adds to the last, and a card in the opposite corner keeps every caption so far. It moves through the steps by itself. It works from what you have open: with a video, page or problem on screen, it marks up that figure and uses its numbers, unless you ask for a fresh example. Math shows as real fractions, roots and powers, objects get smooth curved outlines, and labels stay clear of the arrows. Drawings go on the screen where you asked (the one with the Atticus box) unless you name another. Worked examples and practice problems are written line by line in large text on one panel, readable from your chair on a laptop or a monitor.
 
 The drawing stays while you keep asking about it, and Atticus can add to it; it changes only when an answer draws something new. Click any mark (a box, an arrow, a label, a line of text) to select it, then ask "how does this work?": like Point at your screen, the question carries that mark and a picture of it. While a drawing is up, the Atticus box moves out of its way and comes back when it's gone. Close the card or press Esc to clear it. Steps are spoken only when Read answers aloud is on. The drawings never take focus, and clicks pass through everywhere except on a mark. Turn it off in Settings → General → Draw on screen to show you.
 

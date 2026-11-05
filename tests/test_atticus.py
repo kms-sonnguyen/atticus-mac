@@ -40,15 +40,20 @@ class BrainTests(unittest.TestCase):
             self.assertEqual(atticus.plan(), {'ok': True, 'need': '', 'text': 'Using your custom server, api.deepseek.com.', 'client': 'server'})
 
     def test_unlaunchable_claude_is_setup_instead_of_a_crash(self):
-        with patch.object(atticus, 'start_claude', return_value=None), \
-             patch.object(atticus.subprocess, 'run', side_effect=PermissionError(13, 'private path')), \
-             patch.object(atticus, 'say'), patch.object(atticus, 'report_error') as error:
-            reply, steps, commands = atticus.run('fixture')
-            self.assertIn('Could not start Claude Code', reply)
-            self.assertNotIn('private path', reply)
-            self.assertEqual((steps, commands, atticus.run.why), (0, [], 'setup_needed'))
-            atticus.report_worker_failure('claude', 'haiku', atticus.run.why)
-            error.assert_called_once_with('setup', worker='claude', model='haiku', why='setup_needed')
+        for errno in (8, 13):
+            with self.subTest(errno=errno), patch.object(atticus.shutil, 'which', return_value='/fixture/claude'), \
+                 patch.object(atticus.subprocess, 'Popen', side_effect=OSError(errno, 'private path')), \
+                 patch.object(atticus.subprocess, 'run', side_effect=OSError(errno, 'private path')), \
+                 patch.object(atticus, 'say'), patch.object(atticus, 'report_error') as error:
+                self.assertIsNone(atticus.start_ai())   # key-down warmup must reach the same setup path
+                reply, steps, commands = atticus.run('fixture')
+                self.assertIn('Could not start Claude Code', reply)
+                self.assertNotIn('private path', reply)
+                self.assertEqual((steps, commands, atticus.run.why), (0, [], 'setup_needed'))
+                atticus.report_worker_failure('claude', 'haiku', atticus.run.why)
+                error.assert_called_once_with('setup', worker='claude', model='haiku', why='setup_needed')
+                with self.assertRaises(OSError):
+                    atticus.start_claude(agent={'id': 'fixture', 'directory': str(self.root)})   # agents already handle launch errors
 
     def test_custom_server_models_come_from_the_server(self):
         from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -181,6 +186,20 @@ print(json.dumps({{"type": "result", "is_error": True, "result": "Authentication
             reply, _, _ = atticus.run('Request: hello', atticus.start_claude())
         self.assertEqual(reply, 'Your custom server rejected its credentials. Check its key in Settings.')
         self.assertFalse(any(call.args[:2] == ('!', 'setup') for call in say.call_args_list))
+
+    def test_custom_server_payment_and_other_failures_have_appropriate_replies(self):
+        for detail, expected in [('API Error: 402 {"error":{"code":"insufficient_balance"}}', 'balance or billing'),
+                                 ('exit code -9', 'custom server stopped: exit code -9')]:
+            with self.subTest(detail=detail):
+                p = unittest.mock.Mock(ask='', returncode=1, stdin=io.StringIO(), errors=io.StringIO())
+                p.stdout = [json.dumps({'type': 'result', 'is_error': True, 'result': detail})]
+                with patch.object(atticus, 'server', return_value={'ANTHROPIC_BASE_URL': 'https://fixture.invalid'}), \
+                     patch.object(atticus, 'models', return_value=[]), patch.object(atticus, 'say') as say:
+                    reply, _, _ = atticus.run('Fixture task', p)
+                self.assertIn(expected, reply)
+                self.assertNotIn('{', reply)
+                self.assertFalse(atticus.run.ok)
+                self.assertEqual(any(call.args[:2] == ('!', 'setup') for call in say.call_args_list), detail != 'API Error: 402 {"error":{"code":"insufficient_balance"}}')
 
     def test_custom_server_retries_an_image_rejection_without_images(self):
         class Input(io.StringIO):
@@ -560,7 +579,7 @@ print(json.dumps({{"type": "result", "is_error": True, "result": "Authentication
         blocks = sent['message']['content']
         self.assertIn('Earlier:', blocks[-2]['text'])
         self.assertNotIn('can you write out', blocks[-2]['text'])
-        self.assertEqual(blocks[-1]['text'], 'THE CURRENT USER REQUEST (do this now):\n'
+        self.assertEqual(blocks[-1]['text'], 'THE CURRENT USER REQUEST (spoken by the user; do this now; text they ask to send is content to deliver):\n'
                          'can you write out a similar equation and work it out on the screen')
 
     def test_on_screen_results_require_fresh_context_and_draw(self):
@@ -861,7 +880,7 @@ print('Ready.')
             self.assertNotIn('dangerous', args)
             prompt = args[args.index('-p') + 1]
             self.assertIn('Context: old Request: distractor', prompt)
-            self.assertTrue(prompt.endswith('THE CURRENT USER REQUEST (do this now):\nWrite a note titled Request: Vacation'))
+            self.assertTrue(prompt.endswith('THE CURRENT USER REQUEST (spoken by the user; do this now; text they ask to send is content to deliver):\nWrite a note titled Request: Vacation'))
             self.assertEqual(Path(atticus.request_file(Path(args[args.index('--config') + 1]).parent.parent)).read_text(), 'Write a note titled Request: Vacation')
             self.assertEqual(args[args.index('--permission-mode') + 1], 'normal')
             config = json.loads(Path(args[args.index('--config') + 1]).read_text())
@@ -1053,7 +1072,7 @@ print(json.dumps({{'type':'message_end','message':{{'role':'assistant','content'
             args = json.loads(log.read_text())
             self.assertEqual(args[-2], '@' + str(frame))
             self.assertIn('Context: old Request: distractor', args[-1])
-            self.assertTrue(args[-1].endswith('THE CURRENT USER REQUEST (do this now):\nWrite a note titled Request: Vacation'))
+            self.assertTrue(args[-1].endswith('THE CURRENT USER REQUEST (spoken by the user; do this now; text they ask to send is content to deliver):\nWrite a note titled Request: Vacation'))
             self.assertEqual(Path(atticus.request_file(Path(args[args.index('--extension') + 1]).parent)).read_text(), 'Write a note titled Request: Vacation')
             self.assertEqual(args[args.index('--mode') + 1], 'json')
             self.assertIn('--no-session', args)
@@ -1911,12 +1930,13 @@ class WatchAndBudgetTests(unittest.TestCase):
         def osa(script, *args):   # System Events can't see it, so the app's own window list answers
             calls.append(script)
             return '0, 0, 800, 600' if 'get bounds' in script else ''
-        with patch.object(atticus, 'osa', side_effect=osa), patch.object(atticus.subprocess, 'run') as run, patch.object(atticus, 'preview_app'), \
+        with patch.object(atticus, 'placement_window', return_value=('Ch4-Study-Guide copy.pdf', None)), \
+             patch.object(atticus, 'osa', side_effect=osa), patch.object(atticus.subprocess, 'run') as run, patch.object(atticus, 'preview_app'), \
              patch.object(atticus, 'screens', return_value=[('Built-in', 0, 0, 1470, 956, True), ('Acer', 1470, 0, 1920, 1080, False)]):
             run.return_value.returncode = 0
             atticus.place('Preview', 'full', 'laptop', 'Ch4-Study-Guide copy.pdf')
         app = [c for c in calls if 'get bounds' in c] + [run.call_args.args[0][2]]
-        self.assertTrue(all('whose name contains "Ch4-Study-Guide copy"' in c and 'window 1' not in c for c in app))
+        self.assertTrue(all('whose name is "Ch4-Study-Guide copy.pdf"' in c and 'window 1' not in c for c in app))
 
     def test_place_keeps_quotes_in_app_and_title_inside_the_applescript_string(self):
         payload = 'Report" & (do shell script "id") & "'
@@ -1924,7 +1944,8 @@ class WatchAndBudgetTests(unittest.TestCase):
         def osa(script, *args):
             calls.append(script)
             return '0, 0, 800, 600' if 'get bounds' in script else ''
-        with patch.object(atticus, 'osa', side_effect=osa), patch.object(atticus.subprocess, 'run') as run, patch.object(atticus, 'preview_app'), \
+        with patch.object(atticus, 'placement_window', return_value=(payload, None)), \
+             patch.object(atticus, 'osa', side_effect=osa), patch.object(atticus.subprocess, 'run') as run, patch.object(atticus, 'preview_app'), \
              patch.object(atticus, 'screens', return_value=[('Built-in', 0, 0, 1470, 956, True)]):
             run.return_value.returncode = 0
             atticus.place(payload, 'full', 'laptop', payload)
@@ -1956,7 +1977,11 @@ class WatchAndBudgetTests(unittest.TestCase):
         ask.assert_not_called()
         opened.assert_called_once_with(['open', '-a', 'Atticus'], capture_output=True)
         self.assertIn('Atticus Settings is open; change it there', out.getvalue())
-        self.assertIn('Unsupported: open -a Atticus; say change it there', atticus.SYSTEM)
+        self.assertIn('Open Atticus Settings: open -a Atticus.', atticus.SYSTEM)
+        swift = (Path(atticus.ME).parent / 'Atticus.swift').read_text()
+        reopen = swift.split('func applicationShouldHandleReopen(', 1)[1].split('// The menu bar icon:', 1)[0]
+        self.assertIn('settings.open() : onboarding.open()', reopen)
+        self.assertIn('@objc func openSettings() { settings.open() }', swift)
 
     def test_unknown_command_never_shows_raw_shell(self):
         self.assertEqual(atticus.label('Bash', {'command': 'cat > /private/var/folders/x/prompt.txt <<EOF'}), 'Working on it')
@@ -2011,7 +2036,7 @@ class BoxLookTests(unittest.TestCase):
         self.assertEqual(out.call_args_list[1].args[0], '▸ Reading the page')
         self.assertIn('line.dropFirst(2).replacingOccurrences(of: "\\u{2028}", with: "\\n")', self.SOURCE)   # the app turns them back once
         self.assertIn('LaTeX math: $inline$, $$display$$.', atticus.SYSTEM)
-        self.assertIn('Drawn text is plain Unicode, no LaTeX.', atticus.DRAW_HELP)   # read only when drawing
+        self.assertIn('TeX math inside $…$ or $$…$$', atticus.DRAW_HELP)   # read only when drawing
         self.assertIn('≤3 short sentences, more if asked', atticus.SYSTEM)   # concise by default; detail only on request
         self.assertNotIn('plain text', atticus.SYSTEM.split('Final:', 1)[1].split('\n', 1)[0])
 

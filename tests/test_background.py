@@ -90,6 +90,14 @@ class BackgroundTests(unittest.TestCase):
         self.assertEqual(self.gate('osascript -e \'tell application "Notes" to activate\''), 'allow')
         self.assertEqual(self.gate('printf Notes | xargs open -a'), 'allow')
 
+    def test_focus_denial_names_the_helper_that_opens_behind(self):
+        # a bare "--show --bg" was read as flags for open, or as a Bash background-process problem
+        with patch('sys.stdin', io.StringIO(json.dumps({'tool_input': {'command': 'open -a Safari https://example.com'}}))), \
+             patch('sys.stdout', new_callable=io.StringIO) as out, patch.object(atticus, 'preview_app'):
+            atticus.gate()
+        reason = json.loads(out.getvalue())['hookSpecificOutput']['permissionDecisionReason']
+        self.assertIn(f'{atticus.SHOW} --bg', reason); self.assertIn(atticus.HANDS, reason); self.assertNotIn('background', reason)
+
     def test_one_helper_targets_every_app_and_records_last_window(self):
         with patch.object(atticus.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, json.dumps(self.target))) as run:
             for app in ['Spotify', 'Notes', 'Reminders', 'Finder']:
@@ -240,13 +248,39 @@ class BackgroundTests(unittest.TestCase):
                 self.assertIn('page text',atticus.web('read',url[0],app='Fixture Browser'))
             first,second=[a for a in scripts if 'make new tab' in a[2]]
             self.assertEqual((first[-1],second[-1]),('0','77'))   # the second page reuses the task's window
-            self.assertIn('make new window',first[2]);self.assertIn('set index of prior to 1',first[2])
+            self.assertIn('make new window',first[2]);self.assertIn('set index of w to (count windows)',first[2]);self.assertNotIn('index of prior',first[2])   # its window goes behind; the user's is never pulled forward
             behind.assert_called_once_with('Editor','Fixture Browser',wait=.5)
             saved=Path(atticus.agent_gate_dir(os.environ['ATTICUS_ASK']),'browser-window.json')
             self.assertEqual(json.loads(saved.read_text()),{'app':'Fixture Browser','window':77});self.assertEqual(saved.stat().st_mode&0o777,0o600)
             atticus.close_agent_window(os.environ['ATTICUS_ASK'])
             self.assertIn('close window id 77',scripts[-1][2]);self.assertFalse(saved.exists())
             count=len(scripts);atticus.close_agent_window(os.environ['ATTICUS_ASK']);self.assertEqual(len(scripts),count)   # never a window it did not open
+
+    def test_agent_rereads_of_the_page_its_tab_shows_read_it_live(self):
+        # A configurator changed its own URL as options were picked; reopening the start URL reloaded a fresh tab and lost them.
+        scripts=[];start='https://shop.fixture.test/build';here={'href':start,'document':'1700.5'}
+        def result(args,**kw):
+            if args[0]=='pgrep': return subprocess.CompletedProcess(args,0)
+            script=args[2];scripts.append(script)
+            if 'make new tab' in script: return subprocess.CompletedProcess(args,0,'77\t'+str(len(scripts))+('\tnew' if args[-1]=='0' else '\t'),'')
+            if 'get {name, bounds}' in script: return subprocess.CompletedProcess(args,0,'Fixture, 0, 0, 300, 200','')
+            if 'performance.timeOrigin' in args[-1]: return subprocess.CompletedProcess(args,0,here['href']+'\t'+here['document']+'\n','')
+            return subprocess.CompletedProcess(args,0,json.dumps({'signature':here['href']+'|ready'}) if '"ready", ' in args[-1][-35:] else 'page at '+here['href'],'')
+        made=lambda:len([s for s in scripts if 'make new tab' in s])
+        with patch.dict(os.environ,{'ATTICUS_AGENT':'fixture'}),patch.object(atticus,'browser_adapter',return_value='chromium'),patch.object(atticus,'page_ready',return_value=True), \
+             patch.object(atticus,'preview_app',return_value=None),patch.object(atticus,'hands_map'),patch.object(atticus,'osa',return_value='Editor'), \
+             patch.object(atticus,'keep_behind'),patch.object(atticus,'running_app',return_value='Fixture Browser'),patch.object(atticus.subprocess,'run',side_effect=result):
+            self.assertIn('page at '+start,atticus.web('read',start,app='Fixture Browser'))
+            self.assertEqual(json.loads(Path(os.environ['ATTICUS_ASK'],'web.json').read_text())['opened'],start)
+            here['href']=start+'-large-blue'   # the page's own URL change: the same document
+            self.assertIn('page at '+start+'-large-blue',atticus.web('read',start,app='Fixture Browser'))
+            self.assertIn('page at '+start+'-large-blue',atticus.show(start,bg=True))
+            self.assertEqual(made(),1)   # no new tab, no reload
+            here.update(href=start+'/help',document='1800.25')   # a link loaded a new document: the start URL opens afresh
+            self.assertIn('page at',atticus.web('read',start,app='Fixture Browser'))
+            self.assertEqual(made(),2)
+            here['document']='1900.75';self.assertIn('page at',atticus.web('read',start+'/help',app='Fixture Browser'))   # the URL it shows now
+            self.assertEqual(made(),2)
 
     def test_agent_site_placement_uses_main_open_path_only_when_requested(self):
         url = 'https://unseen.example/catalog'
@@ -377,6 +411,13 @@ class BackgroundTests(unittest.TestCase):
                 if not raised:
                     looked.assert_called_once_with(cleanup=False, window=target)   # the window itself, painted where it sits
                     self.assertIn("--front 'Fixture App' Board --asked", out.getvalue())
+        # Oct 30: tab words naming no window (an Orca tab) raised the app just to read it; the app's own window is pictured instead
+        atticus.save_request(os.environ['ATTICUS_ASK'], 'what is it doing'); marker.unlink(missing_ok=True)
+        with patch.object(atticus, 'window_target', side_effect=lambda app, title='': {} if title else covered), patch.object(atticus, 'osa') as osa, \
+             patch.object(atticus, 'free_focus'), patch.object(atticus, 'look', return_value=[('/fake.jpg', 'Screen 2')]) as looked, \
+             patch('sys.stdout', new_callable=io.StringIO), patch('sys.argv', ['atticus.py', '--front', 'Fixture App', 'Board']):
+            atticus.main()
+        osa.assert_not_called(); looked.assert_called_once_with(cleanup=False, window=covered)
         with patch.object(atticus.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, json.dumps(covered), '')) as run:
             self.assertEqual(atticus.window_target('Fixture App', 'Board'), covered)
             self.assertEqual(run.call_args.args[0], [atticus.APP, '--window-target', 'Fixture App', 'Board'])
@@ -409,6 +450,15 @@ class BackgroundTests(unittest.TestCase):
             labels = [label for _, label in atticus.look(cleanup=False)]
             self.assertEqual(len(calls), 2); self.assertTrue(labels[0].endswith('click spots as 1:x,y in picture pixels)'))
         for path in Path(os.environ['ATTICUS_ASK']).glob('atticus-screen-*'): path.unlink()
+
+    def test_learned_open_replays_in_front_when_the_user_asked_to_open(self):
+        saved = {'cmds': [f"{atticus.ME} --show --bg https://www.netflix.com"], 'reply': 'Netflix is open in Chrome in the background.'}
+        ask = 'Open Netflix.'
+        with patch.object(atticus, 'skills', return_value={'open netflix': saved}), \
+             patch.object(atticus, 'show', return_value='opened https://www.netflix.com in front') as show:
+            with patch.dict(os.environ, {'ATTICUS_REQUEST': ask}):
+                self.assertEqual(atticus.replay('open netflix'), saved['reply'].split('.')[0] + '.')
+            show.assert_called_once_with('https://www.netflix.com', False)
 
     def test_old_foreground_shortcuts_upgrade_to_background_open(self):
         saved={'cmds':['open -a Notes'],'reply':'Done.'}

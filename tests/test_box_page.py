@@ -1,5 +1,6 @@
 """ui/ui.html in a real WKWebView that is never put in a window: a streamed answer, the Learned pill and an agent's done card."""
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -73,6 +74,52 @@ return out;
 '''
 
 
+REAL_MOUSE = r"""import Cocoa
+import WebKit
+// The box page in a real panel, driven by real mouse and wheel events (VM only): WebKit ignores a drag or wheel it did not get from the system.
+final class H: NSObject, WKScriptMessageHandler {
+    var posts: [String] = [], ready: (() -> Void)?
+    func userContentController(_ c: WKUserContentController, didReceive m: WKScriptMessage) {
+        posts.append("\(m.body)")
+        if (m.body as? [String: Any])?["ready"] != nil { ready?(); ready = nil }
+    }
+}
+final class P: NSPanel { override var canBecomeKey: Bool { true } }
+NSApplication.shared.setActivationPolicy(.accessory)
+let h = H(), cfg = WKWebViewConfiguration(); cfg.userContentController.add(h, name: "c"); cfg.userContentController.add(h, name: "h")
+let web = WKWebView(frame: NSRect(x: 0, y: 0, width: 500, height: 500), configuration: cfg)
+let win = P(contentRect: NSRect(x: 100, y: 100, width: 500, height: 500), styleMask: [.nonactivatingPanel], backing: .buffered, defer: false)
+win.level = .statusBar; win.contentView = web; win.orderFrontRegardless(); win.makeKey(); win.makeFirstResponder(web)
+func wait(_ s: Double) { Thread.sleep(forTimeInterval: s) }   // the driver runs off the main thread: the main one must keep handing out events
+func eval(_ j: String) -> Any? { var r: Any?; let d = DispatchSemaphore(value: 0); DispatchQueue.main.async { web.evaluateJavaScript(j) { a, _ in r = a; d.signal() } }; d.wait(); return r }
+let box = win.frame, top = NSScreen.screens[0].frame.height
+func at(_ x: Double, _ y: Double) -> CGPoint { CGPoint(x: box.minX + x, y: top - box.maxY + y) }
+func mouse(_ t: CGEventType, _ x: Double, _ y: Double) { let e = CGEvent(mouseEventSource: CGEventSource(stateID: .privateState), mouseType: t, mouseCursorPosition: at(x, y), mouseButton: .left)!; e.setIntegerValueField(.mouseEventClickState, value: 1); e.post(tap: .cghidEventTap); wait(0.04) }
+func wheel(_ dx: Int32, _ dy: Int32) { for _ in 0..<6 { CGEvent(scrollWheelEvent2Source: CGEventSource(stateID: .privateState), units: .pixel, wheelCount: 2, wheel1: dy, wheel2: dx, wheel3: 0)!.post(tap: .cghidEventTap); wait(0.05) }; wait(0.3) }
+h.ready = { DispatchQueue.global().async {
+    _ = eval("ui.listen(true);ui.words('show code');ui.think();ui.line('✓ Here it is:\\n\\n```\\n'+'long_code_line_'.repeat(30)+'\\n```\\n\\nSome ordinary words after the code box, to select.');1")
+    wait(1)
+    let r = eval("(()=>{const p=document.querySelector('.a pre').getBoundingClientRect(),a=document.querySelector('.a').getBoundingClientRect();return [p.x+40,p.y+15,a.x+20,a.bottom-12]})()") as! [Double]
+    var out: [String: Any] = [:]
+    let left = "document.querySelector('.a pre').scrollLeft"
+    mouse(.mouseMoved, r[0], r[1]); wait(0.3)
+    wheel(-30, 0); out["sideways"] = eval(left); _ = eval(left + "=0"); wait(0.1)
+    wheel(0, -30); out["plain"] = eval(left)
+    h.posts = []
+    mouse(.leftMouseDown, r[2], r[3]); for i in 1...6 { mouse(.leftMouseDragged, r[2] + Double(i * 25), r[3]) }; mouse(.leftMouseUp, r[2] + 150, r[3]); wait(0.3)
+    out["selected"] = eval("getSelection().toString()"); out["dragCopied"] = h.posts.contains { $0.contains("copy") }
+    mouse(.leftMouseDown, r[2], r[3]); mouse(.leftMouseUp, r[2], r[3]); wait(0.6)   // a click on a selection only clears it
+    out["clearCopied"] = h.posts.contains { $0.contains("copy") }; h.posts = []
+    mouse(.leftMouseDown, r[2], r[3]); mouse(.leftMouseUp, r[2], r[3]); wait(0.3)
+    out["clickCopied"] = h.posts.contains { $0.contains("copy") }
+    print(String(data: try! JSONSerialization.data(withJSONObject: out), encoding: .utf8)!); exit(0)
+} }
+web.loadHTMLString(try! String(contentsOfFile: CommandLine.arguments[1], encoding: .utf8), baseURL: nil)
+DispatchQueue.main.asyncAfter(deadline: .now() + 40) { print("timeout"); exit(1) }
+NSApplication.shared.run()
+"""
+
+
 @unittest.skipUnless(sys.platform == 'darwin', 'macOS WebKit page check')
 class BoxPageTests(unittest.TestCase):
     def render(self, script):
@@ -90,6 +137,49 @@ class BoxPageTests(unittest.TestCase):
         got = json.loads(run.stdout.strip().splitlines()[-1])
         self.assertEqual([p for p in got['posts'] if isinstance(p, dict) and 'error' in p], [])
         return got
+
+    @unittest.skipUnless(os.environ.get('ATTICUS_VM'), 'real mouse events: VM only')
+    def test_real_mouse_scrolls_code_selects_text_and_click_copies(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            page, src, binary = Path(tmp) / 'ui.html', Path(tmp) / 'page.swift', Path(tmp) / 'page'
+            page.write_text((ROOT / 'ui/ui.html').read_text().replace('/*ORBS*/', (ROOT / 'ui/orbs.js').read_text()))
+            src.write_text(REAL_MOUSE)
+            built = subprocess.run(['swiftc', str(src), '-o', str(binary)], capture_output=True, text=True)
+            self.assertEqual(built.returncode, 0, built.stderr)
+            run = subprocess.run([str(binary), str(page)], capture_output=True, text=True, timeout=60)
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        out = json.loads(run.stdout.strip().splitlines()[-1])
+        self.assertGreater(out['sideways'], 0)
+        self.assertGreater(out['plain'], 0)
+        self.assertTrue(out['selected'].strip())
+        self.assertFalse(out['dragCopied'] or out['clearCopied'])
+        self.assertTrue(out['clickCopied'])
+
+    def test_mic_click_keeps_listening_until_typing(self):
+        got = self.render(r"""
+await new Promise(r => setTimeout(r, 500));
+const messages = [], bridge = webkit.messageHandlers.c.postMessage.bind(webkit.messageHandlers.c);
+webkit.messageHandlers.c.postMessage = m => {
+    messages.push(m); bridge(m);
+    if (m.mic) ui.listen();
+};
+ui.compose(true); ui.hover(true);
+const mic = document.getElementById('mic'), ask = document.getElementById('ask');
+mic.dispatchEvent(new MouseEvent('mousedown', {bubbles:true})); mic.click();
+ui.hover(true);
+await new Promise(r => setTimeout(r, 350));
+const afterClick = {mic: messages.filter(m => m.mic).length, type: messages.filter(m => m.type).length,
+    hearing: document.body.classList.contains('hearing'), bubble: !!document.querySelector('.q.hear')};
+ask.dispatchEvent(new MouseEvent('mousedown', {bubbles:true}));
+const afterMouse = document.body.classList.contains('hearing');
+ui.listen(); ask.value = 'Fixture request'; ask.dispatchEvent(new Event('input', {bubbles:true}));
+return {afterClick, afterMouse, afterInput: document.body.classList.contains('hearing'),
+    interrupts: messages.filter(m => m.type).length};
+""")['result']
+        self.assertEqual(got['afterClick'], {'mic': 1, 'type': 0, 'hearing': True, 'bubble': True})
+        self.assertFalse(got['afterMouse'])
+        self.assertFalse(got['afterInput'])
+        self.assertEqual(got['interrupts'], 2)
 
     def test_quiet_follow_up_only_changes_status(self):
         got = self.render(r"""
@@ -137,6 +227,8 @@ return {quiet, timeout, gone: document.querySelectorAll('.hf').length, words: th
 
     def test_minimize_keeps_live_work_and_restores_scroll(self):
         got = self.render(r'''
+const tick = ms => new Promise(r => setTimeout(r, ms));
+const settle = () => document.getAnimations().filter(a => a.effect.getTiming().iterations !== Infinity).forEach(a => a.finish());
 ui.listen(true); ui.words('Explain'); ui.think(); ui.mode(false);
 ui.line('… ' + 'A long answer. '.repeat(300));
 const thread = document.getElementById('thread'), fold = document.getElementById('fold');
@@ -144,22 +236,25 @@ const shown = id => getComputedStyle(document.getElementById(id)).display !== 'n
 thread.dispatchEvent(new WheelEvent('wheel', {deltaY: -1})); thread.scrollTop = 45;
 const scroll = thread.scrollTop, height = document.getElementById('card').offsetHeight;
 fold.click();
+await tick(350); settle();
 const out = {compact: [document.body.classList.contains('folded'), document.getElementById('card').offsetHeight < height,
   ...['orb', 'status', 'x'].map(shown), ...['thread', 'comp', 'mode', 'agents-pill', 'grip'].map(shown), fold.getAttribute('aria-expanded')]};
 ui.line('▸ Reading the document'); out.step = document.getElementById('status').textContent;
 ui.tap([30, 20]); ui.hover(true); out.hover = [document.body.classList.contains('folded'), shown('comp')];
 ui.pointer([10, 10]); out.affordance = getComputedStyle(fold).opacity; ui.pointer([]);
-ui.line('✓ ' + 'Finished. '.repeat(300)); ui.finished();
-out.done = [document.body.classList.contains('folded'), getComputedStyle(document.querySelector('#status span'), '::before').content];
-const r = fold.getBoundingClientRect(); ui.pointer([r.x + r.width / 2, r.y + r.height / 2]); ui.tap([r.x + r.width / 2, r.y + r.height / 2]); out.restored = [thread.scrollTop === scroll, shown('mode'), fold.getAttribute('aria-expanded')];
-fold.click(); ui.listen(); out.next = [document.body.classList.contains('folded'), shown('thread')];
-fold.click(); ui.compose(true); out.typing = !document.body.classList.contains('folded');
+ui.line('✓ ' + 'Finished. '.repeat(300));
+const r = fold.getBoundingClientRect(); ui.pointer([r.x + r.width / 2, r.y + r.height / 2]); ui.tap([r.x + r.width / 2, r.y + r.height / 2]); await tick(350); settle(); out.restored = [thread.scrollTop === scroll, shown('mode'), fold.getAttribute('aria-expanded')];
+fold.click(); await tick(350); settle();
+ui.finished(); await tick(350); settle();
+out.done = [document.body.classList.contains('folded'), shown('thread'), thread.scrollHeight - thread.scrollTop - thread.clientHeight < 2];
+fold.click(); await tick(350); settle(); ui.listen(); out.next = [document.body.classList.contains('folded'), shown('thread')];
+fold.click(); await tick(350); settle(); ui.compose(true); out.typing = !document.body.classList.contains('folded');
 return out;
 ''')
         self.assertEqual(got['result'], {
             'compact': [True, True, True, True, True, False, False, False, False, False, 'false'],
             'step': 'Reading the document', 'hover': [True, False], 'affordance': '1',
-            'done': [True, '"Done"'], 'restored': [True, True, 'true'],
+            'done': [False, True, True], 'restored': [True, True, 'true'],
             'next': [False, True], 'typing': True,
         })
         self.assertIn(56, got['posts'])  # the native height bridge shrinks the actual panel
