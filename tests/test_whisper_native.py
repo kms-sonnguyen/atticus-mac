@@ -1,6 +1,7 @@
 """Whisper engine (Atticus.swift `// MARK: Whisper` section) compiled alone against a scratch ATTICUS_DIR."""
 import functools
 import hashlib
+import json
 import http.server
 import os
 from pathlib import Path
@@ -22,7 +23,7 @@ def engine():
     source = (ROOT / "Atticus.swift").read_text()
     prefs = source[source.index("enum Prefs"):source.index("func applySharing(")]
     whisper = source[source.index("// MARK: Whisper"):source.index("// MARK: end Whisper")]
-    return "import Cocoa\nimport AVFoundation\nimport CryptoKit\nlet controlKey = 1, optionKey = 2\n" + prefs + whisper
+    return "import Cocoa\nimport AVFoundation\nimport CryptoKit\nlet controlKey = 1, optionKey = 2\n" + prefs + whisper + '\nWhisper.vadBase = "http://127.0.0.1:9/"\n'
 
 
 @unittest.skipUnless(sys.platform == "darwin", "macOS Swift regression")
@@ -77,7 +78,7 @@ print(String(decoding: try! JSONSerialization.data(withJSONObject: s, options: .
 """)
         import json
         s = json.loads(out)
-        self.assertEqual(set(s), {"server", "model", "running", "error", "models"})
+        self.assertEqual(set(s), {"server", "installing", "model", "running", "error", "models"})
         self.assertEqual((s["model"], s["running"], s["error"]), ("large", False, None))
         self.assertEqual(s["server"], shutil.which("whisper-server") is not None or os.path.exists("/opt/homebrew/bin/whisper-server"))
         self.assertEqual([(m["id"], m["have"], m["progress"]) for m in s["models"]], [("turbo", False, None), ("large", True, None), ("small", False, None)])
@@ -124,6 +125,57 @@ precondition(((w.status()["models"] as! [[String: Any]])[0]["progress"]) is NSNu
 print("ok")
 """, timeout=60)
 
+    def test_meeting_passes_screen_with_vad_and_survive_no_speech(self):
+        # whisper-server 1.9.5 dies on VAD + no speech + language probabilities; meeting passes never ask for probabilities.
+        vad = Path(os.environ.get("ATTICUS_WHISPER_VAD", "~/.config/atticus/whisper/ggml-silero-v6.2.0.bin")).expanduser()
+        if not TURBO.exists() or not vad.exists() or not shutil.which("afconvert") or not shutil.which("whisper-server") and not os.path.exists("/opt/homebrew/bin/whisper-server"):
+            self.skipTest("needs whisper-server, afconvert, the turbo model and the Silero VAD model")
+        if "vi_VN" not in subprocess.run(["say", "-v", "?"], capture_output=True, text=True).stdout:
+            self.skipTest("needs the Vietnamese system voice")
+        root = self.scratch()
+        (root / "whisper").mkdir(); (root / "whisper" / TURBO.name).symlink_to(TURBO)
+        site = root / "site"; site.mkdir(); shutil.copy(vad, site / "ggml-silero-v6.2.0.bin")
+        class Quiet(http.server.SimpleHTTPRequestHandler):
+            def log_message(self, *a): pass
+        httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(Quiet, directory=str(site)))
+        threading.Thread(target=httpd.serve_forever, daemon=True).start(); self.addCleanup(httpd.shutdown)
+        aiff, caf = root / "a.aiff", root / "a.caf"
+        subprocess.run(["say", "-v", "Linh", "-o", str(aiff), "Hôm nay chúng ta sẽ bàn về kế hoạch phát hành phiên bản mới vào thứ sáu."], check=True)
+        subprocess.run(["afconvert", "-f", "caff", "-d", "LEF32@16000", "-c", "1", str(aiff), str(caf)], check=True)
+        data = caf.read_bytes(); (root / "v.f32").write_bytes(data[data.index(b"data") + 16:])
+        out = run_swift(self, engine() + f"""
+import Foundation
+Whisper.vadBase = "http://127.0.0.1:{httpd.server_address[1]}/"
+let voice = try! Data(contentsOf: URL(fileURLWithPath: "{root}/v.f32")).withUnsafeBytes {{ Array($0.bindMemory(to: Float.self)) }}
+var y: Float = 0
+let hum: [Float] = (0..<16000 * 3).map {{ _ in y = 0.92 * y + 0.08 * Float.random(in: -1...1); return y * 0.3 }}
+let hiss: [Float] = (0..<16000 * 3).map {{ _ in Float.random(in: -0.02...0.02) }}
+let sem = DispatchSemaphore(value: 0)
+Task {{
+    Whisper.shared.warm()
+    precondition(!Whisper.shared.screening)                                       // no VAD model yet: this server can't screen
+    let fm = FileManager.default, vad = Whisper.path(Whisper.vad)
+    for _ in 0..<100 where !fm.fileExists(atPath: vad) {{ try await Task.sleep(nanoseconds: 100_000_000) }}
+    precondition(Whisper.sha256(vad) == Whisper.vad.sha256 && !fm.fileExists(atPath: vad + ".part"))
+    _ = try await Whisper.shared.transcribed(hiss, prompt: "", meeting: true)      // nothing in flight: moves to a server that screens
+    precondition(Whisper.shared.screening, "not screening after the VAD model arrived")
+    for _ in 0..<3 {{                                                              // the crash path, three times over
+        let h = try await Whisper.shared.transcribed(hiss, prompt: "", language: "auto", meeting: true)
+        precondition(h.text.isEmpty && h.language == nil, "hiss: \\(h)")
+    }}
+    let n = try await Whisper.shared.transcribed(hum, prompt: "", language: "auto", meeting: true, careful: true)
+    print("hum:", n.text)
+    let v = try await Whisper.shared.transcribed(voice, prompt: "", language: "auto", meeting: true, careful: true)
+    print("voice:", v.text); print("lang:", v.language ?? "nil")
+    precondition(Whisper.shared.status()["running"] as? Bool == true)
+    Whisper.shared.stop(); sem.signal()
+}}
+sem.wait()
+""", timeout=120)
+        self.assertIn("hum: \n", out + "\n")                                   # VAD: noise reaches no decoder
+        self.assertIn("phát hành", out)
+        self.assertIn("lang: vietnamese", out)
+
     def test_live_transcription(self):
         if not TURBO.exists() or not shutil.which("afconvert") or not os.path.exists("/opt/homebrew/bin/whisper-server") and not shutil.which("whisper-server"):
             self.skipTest("needs whisper-server, afconvert and the turbo model")
@@ -154,7 +206,7 @@ sem.wait()
         # Every example is a junk line from a real Vietnamese meeting transcript.
         self.scratch()
         run_swift(self, engine() + """
-let m = MeetingWhisper(hints: "", heard: { _, _ in }, failed: { _ in })
+let m = MeetingWhisper(heard: { _, _ in }, failed: { _ in })
 func eq(_ a: String, _ b: String) { if a != b { print("got:", a, "want:", b); exit(1) } }
 let t = Date()
 eq(m.clean("Mình sẽ pick up những cái đó. Cảm ơn các bạn đã theo dõi và hẹn gặp lại.", at: t), "Mình sẽ pick up những cái đó.")
@@ -175,7 +227,7 @@ eq(m.clean("Hãy subscribe cho kênh Ghiền Mì Gõ Để không bỏ lỡ nh�
 eq(m.clean("Dạ. Dạ.", at: t), "Dạ. Dạ.")
 eq(m.clean("Bản 1.5 có sửa file config.json rồi nhé.", at: t), "Bản 1.5 có sửa file config.json rồi nhé.")
 eq(m.clean("Thank you mọi người.", at: t), "Thank you mọi người.")
-let n = MeetingWhisper(hints: "", heard: { _, _ in }, failed: { _ in })
+let n = MeetingWhisper(heard: { _, _ in }, failed: { _ in })
 eq(n.clean("Anh kiểm tra lại giúp em nhé.", at: t), "Anh kiểm tra lại giúp em nhé.")
 eq(n.clean("Anh kiểm tra lại giúp em nhé.", at: t.addingTimeInterval(120)), "Anh kiểm tra lại giúp em nhé.")
 // live words are cleaned but not remembered, or the final line would be dropped as a repeat of them
@@ -198,6 +250,175 @@ Prefs.set("whisperLanguage", "auto"); precondition(l.request == "vietnamese")
 Prefs.set("whisperLanguage", "de"); precondition(l.request == nil)   // a language picked in Settings always wins
 print("ok")
 """, timeout=30)
+
+    def test_meeting_prompt_names_the_terms_and_drops_read_backs(self):
+        self.scratch()
+        run_swift(self, engine() + """
+func eq(_ a: String, _ b: String) { if a != b { print("got:", a, "want:", b); exit(1) } }
+let w = MeetingWords(title: "QA sync.", names: ["Son", "Linh", "", "Son"], words: ["Playwright", "pull request", "linh", "Jira"])
+eq(w.prompt, "QA sync. With Son and Linh. We talk about Playwright, pull request and Jira.")
+eq(MeetingWords().prompt, "")
+eq(MeetingWords(words: ["API"]).prompt, "We talk about API.")
+let many = MeetingWords(title: String(repeating: "t", count: 140), names: (1...12).map { "Person\\($0)" }, words: (1...90).map { "term\\($0)" })
+precondition(many.prompt.count <= 500 && many.prompt.contains("term1,") && !many.prompt.contains("Person"))   // the terms go last
+let p = w.prompt
+precondition(Whisper.promptEcho("We talk about Playwright, pull request and Jira.", p))   // read back whole
+precondition(Whisper.promptEcho("We talk about Playwr", p))                              // cut off mid-word
+precondition(Whisper.promptEcho("Playwright, pull request", p))
+precondition(!Whisper.promptEcho("Playwright", p) && !Whisper.promptEcho("pull request", p))   // a term on its own can be said for real
+precondition(!Whisper.promptEcho("Mình chạy Playwright trên pull request này nhé", p))
+precondition(!Whisper.promptEcho("Linh ơi, Jira ticket đâu rồi?", p))
+precondition(!Whisper.promptEcho("anything", ""))
+print("ok")
+""", timeout=30)
+
+    def test_echo_gate_drops_the_call_heard_on_the_mic_and_nothing_of_yours(self):
+        self.scratch()
+        run_swift(self, engine() + """
+let t0 = Date()
+func at(_ a: Double, _ b: Double) -> EchoGate.Span { EchoGate.Span(start: t0.addingTimeInterval(a), end: t0.addingTimeInterval(b)) }
+let theirs = [(text: "Chúng ta cần deploy bản hotfix lên production trước thứ sáu.", span: at(10, 14)),
+              (text: "Anh kiểm tra lại API gateway giúp em nhé.", span: at(16, 18))]
+precondition(EchoGate.echo("chúng ta cần deploy bản hotfix lên production trước thứ sáu", at(10.2, 14.3), of: theirs))      // their words off the speakers
+precondition(EchoGate.echo("Chúng ta cần deploy bản hotfix lên production trước", at(10.2, 13.8), of: theirs))              // a clipped copy
+precondition(!EchoGate.echo("Chúng ta cần deploy bản hotfix lên production trước thứ sáu.", at(40, 44), of: theirs))       // said again later: yours
+precondition(!EchoGate.echo("Dạ vâng ạ", at(14, 15), of: theirs))                                                         // a reply always stays
+precondition(!EchoGate.echo("ok", at(16, 17), of: theirs))
+precondition(!EchoGate.echo("Em nghĩ mình nên deploy sau khi test xong thôi.", at(12, 15), of: theirs))                    // yours, over them
+precondition(!EchoGate.echo("kiểm tra lại API gateway", at(16, 18), of: theirs))                                           // under 6 words: always yours
+precondition(!EchoGate.echo("production trước thứ sáu thì chúng ta cần deploy", at(11, 14), of: theirs))                  // their words, not in their order
+precondition(!EchoGate.echo("em deploy bản hotfix lên rồi anh ơi", at(11, 14), of: theirs))                                // 4 in a row of 8: yours
+precondition(EchoGate.echo("Anh kiểm tra lại API gateway giúp em", at(16, 18), of: theirs))
+// waits for the call, keeps order, and gives up after 6 s
+let g = EchoGate(); var out: [String] = []
+for l in theirs { g.heardCall(l.text, l.span) }
+g.mic("Em nghĩ mình nên deploy sau khi test xong thôi.", at(12, 15), now: t0.addingTimeInterval(15)) { out.append($0) }
+g.mic("Anh kiểm tra lại API gateway giúp em nhé.", at(16, 18), now: t0.addingTimeInterval(18)) { out.append($0) }
+g.release(callThrough: t0.addingTimeInterval(14), now: t0.addingTimeInterval(18)); precondition(out.isEmpty)   // the call hasn't read 14-15 yet
+g.release(callThrough: t0.addingTimeInterval(15), now: t0.addingTimeInterval(19)); precondition(out == ["Em nghĩ mình nên deploy sau khi test xong thôi."])
+g.release(callThrough: t0.addingTimeInterval(15), now: t0.addingTimeInterval(24.5)); precondition(out.count == 2 && out[1] == "" && g.dropped == 1)   // 6 s: decided anyway
+let fresh = EchoGate(); var late: [String] = []
+fresh.mic("Mình sẽ review pull request này chiều nay nhé.", at(1, 4), now: t0) { late.append($0) }
+fresh.mic("", at(5, 6), now: t0) { late.append($0) }
+fresh.release(callThrough: .distantFuture, now: t0); precondition(late == ["Mình sẽ review pull request này chiều nay nhé.", ""])   // meeting end: all out
+print("ok")
+""", timeout=30)
+
+    def test_garbled_answers_and_releasing_the_lock(self):
+        self.scratch()
+        run_swift(self, engine() + """
+precondition(Whisper.garbled("") && Whisper.garbled("  . , "))
+precondition(Whisper.garbled("ok ok ok ok ok ok ok ok ok"))                       // a loop: whisper lost its way
+precondition(!Whisper.garbled("Dạ") && !Whisper.garbled("Dạ. Dạ. Dạ."))          // short replies are not loops
+precondition(!Whisper.garbled("Chúng ta cần deploy bản hotfix lên production trước thứ sáu."))
+let l = MeetingLanguage()
+l.note("vietnamese", seconds: 5); l.note("vietnamese", seconds: 5); precondition(l.pinned == "vietnamese")
+l.release(); precondition(l.pinned == nil)
+l.note("english", seconds: 5); precondition(l.pinned == nil)                    // one clip after a release never locks
+l.note("english", seconds: 5); precondition(l.pinned == "english")
+print("ok")
+""", timeout=30)
+
+    def recheck_run(self, *, screened, open_text, seconds=4.0):
+        """One line through MeetingWhisper with a fake pass: the locked pass hears nothing, the open one hears open_text."""
+        root = self.scratch()
+        aiff, caf = root / "a.aiff", root / "a.caf"
+        subprocess.run(["say", "-o", str(aiff), "We need to ship the hotfix to production before Friday, then review the pull request."], check=True)
+        subprocess.run(["afconvert", "-f", "caff", "-d", "LEF32@16000", "-c", "1", str(aiff), str(caf)], check=True)
+        data = caf.read_bytes(); (root / "v.f32").write_bytes(data[data.index(b"data") + 16:])
+        return run_swift(self, engine() + f"""
+import Foundation
+let voice = try! Data(contentsOf: URL(fileURLWithPath: "{root}/v.f32")).withUnsafeBytes {{ Array($0.bindMemory(to: Float.self)) }}
+let clip = Array(voice.prefix(Int({seconds} * 16000))) + [Float](repeating: 0, count: 16000)
+final class Calls: @unchecked Sendable {{ let lock = NSLock(); var all: [String] = [] }}
+let calls = Calls(), lang = MeetingLanguage()
+lang.note("vietnamese", seconds: 5); lang.note("vietnamese", seconds: 5)
+Prefs.set("whisperLanguage", "auto")
+var finals: [String] = []
+let m = MeetingWhisper(language: lang, heard: {{ t, final in if final {{ finals.append(t) }} }}, failed: {{ print("failed", $0); exit(1) }},
+    pass: {{ _, _, language, careful in
+        calls.lock.withLock {{ calls.all.append("\\(language ?? "nil")/\\(careful ? "beam" : "greedy")") }}
+        return language == "auto" ? ({json.dumps(open_text, ensure_ascii=False)}, "english") : ("", nil)
+    }}, screened: {{ {"true" if screened else "false"} }})
+let b = AVAudioPCMBuffer(pcmFormat: AVAudioFormat(standardFormatWithSampleRate: 16000, channels: 1)!, frameCapacity: AVAudioFrameCount(clip.count))!
+b.frameLength = AVAudioFrameCount(clip.count); clip.withUnsafeBufferPointer {{ b.floatChannelData![0].update(from: $0.baseAddress!, count: clip.count) }}
+m.audio.append(b)
+Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) {{ _ in m.tick() }}
+DispatchQueue.main.asyncAfter(deadline: .now() + 4) {{
+    print("calls:", calls.lock.withLock {{ calls.all }}.filter {{ $0.hasSuffix("beam") }}.joined(separator: " "))
+    print("finals:", finals.joined(separator: " | ")); print("pinned:", lang.pinned ?? "nil"); exit(0)
+}}
+RunLoop.main.run()
+""", timeout=60)
+
+    def test_locked_stream_asks_again_open_and_releases_on_a_clear_answer(self):
+        out = self.recheck_run(screened=True, open_text="We need to ship the hotfix to production before Friday.")
+        self.assertIn("calls: vietnamese/beam auto/beam", out)               # finals are careful; the open pass came second
+        self.assertIn("finals: We need to ship the hotfix to production before Friday.", out)
+        self.assertIn("pinned: nil", out)                                   # released; one line never locks again
+
+    def test_lock_stays_without_vad_or_on_a_weak_open_answer(self):
+        out = self.recheck_run(screened=False, open_text="We need to ship the hotfix to production before Friday.")
+        self.assertIn("calls: vietnamese/beam\n", out)                       # no VAD: an open pass over noise is how junk came back
+        self.assertIn("pinned: vietnamese", out)
+        out = self.recheck_run(screened=True, open_text="Угу угу")
+        self.assertIn("calls: vietnamese/beam auto/beam", out)
+        self.assertIn("pinned: vietnamese", out)                            # a short open answer never takes over
+        self.assertNotIn("Угу", out.split("finals:")[1].split("\n")[0])
+        out = self.recheck_run(screened=True, open_text="We need to ship the hotfix to production.", seconds=1.5)
+        self.assertIn("pinned: vietnamese", out)                            # under 2 s of voice: too little to judge the lock
+
+    def quiet_stream_run(self, *, lead, peak):
+        """A stream: `lead` seconds of background ("hush" or "hiss"), then the `say` voice scaled to `peak`, then a pause."""
+        root = self.scratch()
+        aiff, caf = root / "a.aiff", root / "a.caf"
+        subprocess.run(["say", "-o", str(aiff), "We need to ship the hotfix to production before Friday."], check=True)
+        subprocess.run(["afconvert", "-f", "caff", "-d", "LEF32@16000", "-c", "1", str(aiff), str(caf)], check=True)
+        data = caf.read_bytes(); (root / "v.f32").write_bytes(data[data.index(b"data") + 16:])
+        return run_swift(self, engine() + f"""
+import Foundation
+let raw = try! Data(contentsOf: URL(fileURLWithPath: "{root}/v.f32")).withUnsafeBytes {{ Array($0.bindMemory(to: Float.self)) }}
+let top = raw.map {{ abs($0) }}.max()!, voice = raw.map {{ $0 / top * {peak} }}
+func bed(_ s: Double) -> [Float] {{ (0..<Int(s * 16000)).map {{ _ in Float.random(in: {"-0.0005...0.0005" if lead == "hush" else "-0.015...0.015"}) }} }}
+let all = bed(3) + ({"voice + bed(1.5)" if lead == "hush" else "bed(3)"})
+final class Calls: @unchecked Sendable {{ let lock = NSLock(); var n = 0 }}
+let calls = Calls()
+var finals: [String] = []
+let m = MeetingWhisper(heard: {{ t, final in if final && !t.isEmpty {{ finals.append(t) }} }}, failed: {{ print("failed", $0); exit(1) }},
+    pass: {{ _, _, _, careful in calls.lock.withLock {{ calls.n += 1 }}; return (careful ? "heard it" : "", nil) }}, screened: {{ false }})
+var at = 0
+Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) {{ t in
+    guard at < all.count else {{ t.invalidate(); return }}
+    let piece = Array(all[at..<min(all.count, at + 1600)]); at += piece.count
+    let b = AVAudioPCMBuffer(pcmFormat: AVAudioFormat(standardFormatWithSampleRate: 16000, channels: 1)!, frameCapacity: AVAudioFrameCount(piece.count))!
+    b.frameLength = AVAudioFrameCount(piece.count); piece.withUnsafeBufferPointer {{ b.floatChannelData![0].update(from: $0.baseAddress!, count: piece.count) }}
+    m.audio.append(b)
+}}
+Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) {{ _ in m.tick() }}
+DispatchQueue.main.asyncAfter(deadline: .now() + Double(all.count) / 16000 + 2) {{
+    print("finals:", finals.joined(separator: " | ")); print("passes:", calls.lock.withLock {{ calls.n }})
+    print(String(format: "level: %.4f", m.level)); print("summary:", m.summary); exit(0)
+}}
+RunLoop.main.run()
+""", timeout=60)
+
+    def test_quiet_mic_is_heard_against_its_own_noise_floor(self):
+        self.scratch()
+        run_swift(self, engine() + """
+precondition(MeetingWhisper.level(floor: 0) == 0.005 && MeetingWhisper.level(floor: 0.003) == 0.009 && MeetingWhisper.level(floor: 0.05) == 0.02)
+let quiet = [Float](repeating: 0.012, count: 8000)
+precondition(!MeetingWhisper.hasSpeech(quiet) && MeetingWhisper.hasSpeech(quiet, level: 0.005))   // the old fixed 0.02 never heard it
+print("ok")
+""", timeout=30)
+        out = self.quiet_stream_run(lead="hush", peak=0.012)   # a quiet headset in a quiet room
+        self.assertIn("finals: heard it", out)
+        self.assertIn("level: 0.0050", out)
+        self.assertRegex(out, r"1 sent, 1 with words")
+
+    def test_hiss_in_a_noisy_room_still_never_reaches_whisper(self):
+        out = self.quiet_stream_run(lead="hiss", peak=0)
+        self.assertIn("passes: 0", out)
+        self.assertIn("level: 0.0200", out)                                   # the cap: never stricter or looser than before for noise
 
     def test_meeting_speech_check_hears_voices_not_noise(self):
         if not shutil.which("afconvert"):
@@ -285,8 +506,8 @@ var y: Float = 0
 let noise: [Float] = (0..<16000 * 10).map {{ i in y = 0.92 * y + 0.08 * Float.random(in: -1...1); return y * 0.2 * (0.5 + 0.5 * sin(Float(i) / 16000 * 2 * .pi * 0.4)) }}
 let callAudio = load("{root}/call.f32"), micAudio = load("{root}/mic.f32") + noise
 var callFinals: [String] = [], micFinals: [String] = []
-let c = MeetingWhisper(hints: "", heard: {{ t, final in if final && !t.isEmpty {{ callFinals.append(t) }} }}, failed: {{ print("failed", $0); exit(1) }})
-let m = MeetingWhisper(hints: "", heard: {{ t, final in if final && !t.isEmpty {{ micFinals.append(t) }} }}, failed: {{ print("failed", $0); exit(1) }})
+let c = MeetingWhisper(heard: {{ t, final in if final && !t.isEmpty {{ callFinals.append(t) }} }}, failed: {{ print("failed", $0); exit(1) }})
+let m = MeetingWhisper(heard: {{ t, final in if final && !t.isEmpty {{ micFinals.append(t) }} }}, failed: {{ print("failed", $0); exit(1) }})
 Whisper.shared.warm()
 func feed(_ w: MeetingWhisper, _ all: [Float]) {{
     var at = 0
@@ -331,7 +552,7 @@ let buf = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: AVAu
 try! file.read(into: buf)
 let all = Array(UnsafeBufferPointer(start: buf.floatChannelData![0], count: Int(buf.frameLength))) + [Float](repeating: 0, count: 24000)
 var live = 0, finals: [String] = []
-let m = MeetingWhisper(hints: "", heard: {{ text, final in if final {{ if !text.isEmpty {{ finals.append(text) }} }} else {{ live += 1 }} }}, failed: {{ print("failed", $0); exit(1) }})
+let m = MeetingWhisper(heard: {{ text, final in if final {{ if !text.isEmpty {{ finals.append(text) }} }} else {{ live += 1 }} }}, failed: {{ print("failed", $0); exit(1) }})
 Whisper.shared.warm()
 var at = 0
 Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) {{ _ in   // real time, then a pause

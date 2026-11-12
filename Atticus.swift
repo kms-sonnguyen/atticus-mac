@@ -372,6 +372,10 @@ final class Whisper: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
         Model(id: "large", name: "Large v3", file: "ggml-large-v3-q5_0.bin", sha256: "d75795ecff3f83b5faa89d1900604ad8c780abd5739fae406de19f23ecd98ad1", bytes: 1081140203),
         Model(id: "small", name: "Small", file: "ggml-small-q5_1.bin", sha256: "ae85e4a935d7a567bd102fe55afc16bb595bdb618e11b2fc7591bc08120411bb", bytes: 190085487)]
     static var base = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/"   // tests point models and base at a local server
+    // Silero VAD (885 KB), fetched next to the speech model the first time the server starts. With it, meeting passes skip the
+    // stretches that aren't speech, where Whisper invents lines in any language. The server only uses it on requests that ask.
+    static var vad = Model(id: "vad", name: "Silero VAD", file: "ggml-silero-v6.2.0.bin", sha256: "2aa269b785eeb53a82983a20501ddf7c1d9c48e33ab63a41391ac6c9f7fb6987", bytes: 885098)
+    static var vadBase = "https://huggingface.co/ggml-org/whisper-vad/resolve/main/"
     static func model(_ id: String) -> Model { models.first { $0.id == id } ?? models[0] }
     static var installing = false   // Settings → Install runs brew in the background
     static var dir: String { (Prefs.path as NSString).deletingLastPathComponent + "/whisper" }
@@ -386,7 +390,7 @@ final class Whisper: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
 
     private struct Download { let task: URLSessionDownloadTask, changed: @Sendable () -> Void; var progress = 0.0, pinged = Date.distantPast }
     private let lock = NSLock()
-    private var proc: Process?, port = 0, serving: String?, up: Task<Bool, Never>?, idle: DispatchWorkItem?
+    private var proc: Process?, port = 0, serving: String?, up: Task<Bool, Never>?, idle: DispatchWorkItem?, screens = false, fetchingVad = false, inflight = 0
     private var heard: String?, server: String?, have: Set<String> = [], downloads: [String: Download] = [:], error: String?
     private lazy var session = URLSession(configuration: .default, delegate: self, delegateQueue: nil)   // touched under lock
 
@@ -484,28 +488,49 @@ final class Whisper: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
         proc?.terminate(); proc = nil; serving = nil   // the wrapper's trap takes its server down with it
     }
 
-    private func ensure() throws -> (Task<Bool, Never>, Int) {
+    // using: a request follows, counted until it ends. A server started before the VAD model arrived moves to one that screens the
+    // next time nothing is in flight, so the first meeting after an update screens within a pass or two.
+    private func ensure(using: Bool = false) throws -> (Task<Bool, Never>, Int) {
         lock.lock(); defer { lock.unlock() }
         let m = Self.model(Prefs.str("whisperModel")), file = Self.path(m)
         touch()
-        if let up, proc?.isRunning == true, serving == m.id { return (up, port) }
+        if let up, proc?.isRunning == true, serving == m.id, screens || inflight > 0 || !FileManager.default.fileExists(atPath: Self.path(Self.vad)) {
+            if using { inflight += 1 }
+            return (up, port)
+        }
         guard let bin = Self.serverPath() else { throw Failed("whisper-server isn’t installed. Run brew install whisper.cpp.") }
         guard FileManager.default.fileExists(atPath: file) else { throw Failed("The \(m.name) model isn’t downloaded.") }
         guard let free = Self.freePort() else { throw Failed("No free port for whisper-server.") }
         up?.cancel(); proc?.terminate()   // only the server this Atticus started; other whisper-servers are left alone
+        let vad = FileManager.default.fileExists(atPath: Self.path(Self.vad))
+        if !vad { fetchVad() }   // the server after this one screens
         let p = Process(); p.executableURL = URL(fileURLWithPath: "/bin/sh")
         p.arguments = ["-c", """
-            "$0" -m "$1" --host 127.0.0.1 --port \(free) -t \(Self.threads) -nt & s=$!
+            "$0" -m "$1" --host 127.0.0.1 --port \(free) -t \(Self.threads) -nt \(vad ? "-vm \"$2\"" : "") & s=$!
             trap 'kill $s 2>/dev/null; exit 0' TERM INT
             while kill -0 \(getpid()) 2>/dev/null && kill -0 $s 2>/dev/null; do sleep 1 & wait $!; done
             kill $s 2>/dev/null
-            """, bin, file]
+            """, bin, file, Self.path(Self.vad)]
         p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice
         try p.run()
-        proc = p; port = free; serving = m.id
+        proc = p; port = free; serving = m.id; screens = vad; if using { inflight += 1 }
         let t = Task.detached { await Self.waitReady(free) }
         up = t; return (t, free)
     }
+    private func fetchVad() {   // caller holds lock; a wrong or half file never lands, and the next server start tries again
+        guard !fetchingVad, let url = URL(string: Self.vadBase + Self.vad.file) else { return }
+        fetchingVad = true
+        URLSession.shared.downloadTask(with: url) { [weak self] tmp, resp, _ in
+            let dest = Self.path(Self.vad), part = dest + ".part", fm = FileManager.default
+            if let tmp, (resp as? HTTPURLResponse)?.statusCode == 200 {
+                try? fm.createDirectory(atPath: Self.dir, withIntermediateDirectories: true); try? fm.removeItem(atPath: part)
+                if (try? fm.moveItem(at: tmp, to: URL(fileURLWithPath: part))) == nil || Self.sha256(part) != Self.vad.sha256 || rename(part, dest) != 0 { try? fm.removeItem(atPath: part) }
+            }
+            self?.lock.withLock { self?.fetchingVad = false }
+        }.resume()
+    }
+    // Meeting passes ask the server to skip what isn't speech only when it was started with the VAD model.
+    var screening: Bool { lock.withLock { screens && proc?.isRunning == true } }
     private func touch() {   // caller holds lock
         idle?.cancel()
         let w = DispatchWorkItem { [weak self] in self?.stop() }
@@ -535,10 +560,14 @@ final class Whisper: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
     }
 
     func transcribe(_ pcm: [Float], prompt: String) async throws -> String { try await transcribed(pcm, prompt: prompt).text }
-    func transcribed(_ pcm: [Float], prompt: String, language: String? = nil) async throws -> (text: String, language: String?) {
+    // meeting: no language probabilities (a third of each pass, and with VAD on a clip with no speech they crash whisper-server 1.9.5),
+    // and VAD when the server has it. careful: beam search (5), for lines that are kept; live words stay greedy. quiet: the level
+    // under which a clip is silence and never sent (dictation keeps 0.01; meetings judge level per stream).
+    func transcribed(_ pcm: [Float], prompt: String, language: String? = nil, meeting: Bool = false, careful: Bool = false, quiet: Float = 0.01) async throws -> (text: String, language: String?) {
         // under 0.3 s is a tap; silence gets an invented "Thank you." / "Terima kasih." from Whisper
-        guard pcm.count > 16000 * 3 / 10, pcm.contains(where: { abs($0) > 0.01 }) else { return ("", nil) }
-        let (up, port) = try ensure()
+        guard pcm.count > 16000 * 3 / 10, pcm.contains(where: { abs($0) > quiet }) else { return ("", nil) }
+        let (up, port) = try ensure(using: true)
+        defer { lock.withLock { inflight -= 1 } }
         guard await up.value else { stop(); throw Failed("whisper-server didn’t start.") }   // the next try starts a fresh one
         let boundary = "atticus-\(UUID().uuidString)", lang = language ?? Prefs.str("whisperLanguage"), auto = lang.isEmpty || lang == "auto"
         // under 1.5 s auto-detect guesses wildly (a flash of Chinese): use the language last heard clearly, else the Mac's
@@ -546,6 +575,8 @@ final class Whisper: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
         var body = Data()
         func field(_ name: String, _ value: String) { body.append(Data("--\(boundary)\r\nContent-Disposition: form-data; name=\"\(name)\"\r\n\r\n\(value)\r\n".utf8)) }
         field("response_format", "verbose_json"); field("temperature", "0"); field("language", sent)
+        if meeting { field("no_language_probabilities", "true"); if screening { field("vad", "true") } }   // never VAD without the first: the crash
+        if careful { field("beam_size", "5") }
         if !prompt.isEmpty { field("prompt", prompt) }
         body.append(Data("--\(boundary)\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\nContent-Type: audio/wav\r\n\r\n".utf8))
         body.append(Self.wav(pcm)); body.append(Data("\r\n--\(boundary)--\r\n".utf8))
@@ -563,8 +594,36 @@ final class Whisper: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
         // segments Whisper itself rates as probably not speech are its hallucinations
         let segments = json["segments"] as? [[String: Any]] ?? []
         let text = segments.isEmpty ? json["text"] as? String ?? ""
-            : segments.filter { ($0["no_speech_prob"] as? Double ?? 0) < 0.6 }.compactMap { $0["text"] as? String }.map { Self.withoutInvented($0) }.joined(separator: " ")
-        return (text.split(whereSeparator: \.isWhitespace).joined(separator: " "), json["detected_language"] as? String)
+            : segments.filter { ($0["no_speech_prob"] as? Double ?? 0) < 0.6 }.compactMap { $0["text"] as? String }
+                .filter { !meeting || !Self.promptEcho($0, prompt) }.map { Self.withoutInvented($0) }.joined(separator: " ")
+        let said = text.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        guard meeting else { return (said, json["detected_language"] as? String) }
+        // no probabilities: the language the pass decoded in, which means nothing when nothing was heard (an empty pass says English)
+        let decoded = said.isEmpty ? nil : json["language"] as? String
+        if auto, let decoded, pcm.count >= 48000 { lock.withLock { heard = decoded } }   // 3 s of words: the guess for the next short clip
+        return (said, decoded)
+    }
+    // Whisper reading its prompt back when it has nothing to read (Yogurt's isPromptEcho, MIT): the line is two or more of the
+    // prompt's words in order and nothing of its own (one stray word in a run of 4+). Its last word may be cut mid-word. One or two
+    // words are kept (Yogurt drops two): people do say a name or a dictionary term like "pull request" on its own.
+    static func promptEcho(_ text: String, _ prompt: String) -> Bool {
+        let words = { (s: String) in s.lowercased().split(whereSeparator: { !$0.isLetter && !$0.isNumber }).map(String.init) }
+        let t = words(text), p = words(prompt)
+        guard t.count >= 3, t.count <= p.count + 1 else { return false }
+        let same = { (k: Int, w: String) in w == t[k] || k == t.count - 1 && t[k].count >= 3 && w.hasPrefix(t[k]) }
+        var run = 0
+        for a in t.indices { for i in p.indices {
+            var n = 0
+            while a + n < t.count, i + n < p.count, same(a + n, p[i + n]) { n += 1 }
+            run = max(run, n)
+        } }
+        return run == t.count || run >= 4 && t.count - run <= 1
+    }
+    // Yogurt's test (MIT, FrigadeHQ/yogurt asr/transcribe.ts): empty, or 8+ words that are mostly the same few. Whisper lost its
+    // way, usually because it was told the wrong language.
+    static func garbled(_ text: String) -> Bool {
+        let words = text.lowercased().split(whereSeparator: { !$0.isLetter && !$0.isNumber })
+        return words.isEmpty || words.count >= 8 && Double(Set(words).count) / Double(words.count) <= 0.25
     }
     // Closing lines of the videos Whisper trained on, which it invents over noise and no_speech_prob doesn't catch. They can stick to the
     // end of real speech with no full stop between, so the text is cut from the first one on, never dropped whole.
@@ -591,7 +650,31 @@ final class Whisper: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
 // Passes on a stream run one at a time, so lines stay in order. Three failed finals in a row report an error.
 // Whisper never says "no speech" (noise scores no_speech_prob 0 and comes back as a video's sign-off, in any language), so Apple's
 // sound classifier decides first: noise, keys and hum score under 0.04, voices over 0.8, in about 60 ms. The previous line isn't sent as a prompt.
-// On Auto, one meeting's language locks once two long lines agree: both streams share a MeetingLanguage.
+// With the VAD model the server also skips what isn't speech inside a clip. Kept lines use beam search; live words stay greedy.
+// On Auto, each stream's language locks once two of its long lines agree (the call and your mic can differ). A locked stream whose
+// final comes back empty or looping asks once more with the language open; a long clear answer there releases the lock (Yogurt, MIT).
+// What a meeting's prompt carries (after Yogurt's vocab.ts, MIT): the title, the people, and your Dictation dictionary, so names
+// and English terms come out spelled right ("ClioRio" became Playwright, "giữa FSP" Zephyr Scale on test audio). Sentences give
+// Whisper context a bare list doesn't. English even for Vietnamese: a Vietnamese sentence spelled the terms no better.
+struct MeetingWords {
+    var title = "", names: [String] = [], words: [String] = []
+    var prompt: String {
+        func list(_ xs: [String]) -> String { xs.count < 2 ? xs.joined() : xs.dropLast().joined(separator: ", ") + " and " + xs.last! }
+        let clean = { (xs: [String]) in xs.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }.reduce(into: [String]()) { if !$0.contains($1) { $0.append($1) } } }
+        var title = String(title.trimmingCharacters(in: .whitespacesAndNewlines).prefix(150)).trimmingCharacters(in: CharacterSet(charactersIn: ". "))
+        var names = Array(clean(names).prefix(12))
+        let said = Set(names.map { $0.lowercased() })
+        var words = clean(words).filter { !said.contains($0.lowercased()) }
+        let build = { () -> String in
+            [title.isEmpty ? "" : title + ".", names.isEmpty ? "" : "With " + list(names) + ".",
+             words.isEmpty ? "" : "We talk about " + list(words) + "."].filter { !$0.isEmpty }.joined(separator: " ")
+        }
+        while build().count > 500, !names.isEmpty { names.removeLast() }   // Whisper reads about 220 tokens; the terms are what this is for
+        if build().count > 500 { title = "" }
+        while build().count > 500, !words.isEmpty { words.removeLast() }
+        return build()
+    }
+}
 final class MeetingLanguage: @unchecked Sendable {   // main thread only
     private(set) var pinned: String?
     private var seen: String?
@@ -599,6 +682,7 @@ final class MeetingLanguage: @unchecked Sendable {   // main thread only
         guard pinned == nil, let language, seconds >= 3 else { return }
         if seen == language { pinned = language } else { seen = language }
     }
+    func release() { pinned = nil; seen = nil }   // a new lock needs two lines again: one odd clip never moves it
     var request: String? { ["", "auto"].contains(Prefs.str("whisperLanguage")) ? pinned : nil }
 }
 private final class SpeechScore: NSObject, SNResultsObserving {
@@ -609,10 +693,29 @@ final class MeetingWhisper: @unchecked Sendable {   // touched on the main threa
     let audio = WhisperAudio()
     nonisolated(unsafe) private static var running = 0, freed = Date.distantPast   // passes in flight, both streams; when the last ended
     nonisolated(unsafe) private static weak var lastLive: MeetingWhisper?
-    private let hints: String, heard: (String, Bool) -> Void, failed: (String) -> Void, language: MeetingLanguage
+    // One Whisper pass: audio, prompt, language (nil: Settings'), careful (beam search). Tests pass their own.
+    typealias Pass = @Sendable ([Float], String, String?, Bool) async throws -> (text: String, language: String?)
+    private let words: MeetingWords, heard: (String, Bool) -> Void, failed: (String) -> Void, language: MeetingLanguage, pass: Pass, screened: () -> Bool
     private var busy = false, ask = 0, sent = 0, asked = Date.distantPast, fails = 0, seen = 0, grew = Date()
     private var recent: [(text: String, at: Date)] = []
-    init(hints: String, language: MeetingLanguage = MeetingLanguage(), heard: @escaping (String, Bool) -> Void, failed: @escaping (String) -> Void) { self.hints = hints; self.language = language; self.heard = heard; self.failed = failed }
+    // This stream's loudness (after Yogurt's chunker, MIT): a frame is loud over 3x the stream's noise floor, the quietest tenth of
+    // its 20 ms frame peaks over the last minute, kept between 0.005 and the old fixed 0.02. A quiet headset peaks near 0.01 and
+    // never passed 0.02; Whisper and the VAD read speech down to 0.006. Apple's classifier still decides voice from noise.
+    private var peaks: [Float] = [], scanned = 0
+    private(set) var level: Float = 0.02
+    private(set) var counts = (loudest: Float(0), seconds: 0.0, quiet: 0, noise: 0, sent: 0, lines: 0, capped: 0, longest: 0.0)   // for the log when the meeting ends
+    // When the final line just heard was said, on the wall clock (audio arrives in real time), and where a final still being read starts
+    private(set) var span: EchoGate.Span?
+    private var reading: Date?
+    // Everything this stream heard before this moment is transcribed or thrown away: the echo gate waits for it.
+    var through: Date { reading ?? Date().addingTimeInterval(-audio.seconds) }
+    static func level(floor: Float) -> Float { min(0.02, max(0.005, floor * 3)) }
+    // the meeting's own gates decide what is loud enough, so the pass's "silence" check sits under the lowest level
+    init(words: MeetingWords = MeetingWords(), language: MeetingLanguage = MeetingLanguage(), heard: @escaping (String, Bool) -> Void, failed: @escaping (String) -> Void,
+         pass: @escaping Pass = { try await Whisper.shared.transcribed($0, prompt: $1, language: $2, meeting: true, careful: $3, quiet: 0.004) },
+         screened: @escaping () -> Bool = { Whisper.shared.screening }) {
+        self.words = words; self.language = language; self.heard = heard; self.failed = failed; self.pass = pass; self.screened = screened
+    }
     static func isSpeech(_ pcm: [Float]) -> Bool {   // anything under its 1 s window is too short to trust; a broken classifier lets audio through
         guard let format = AVAudioFormat(standardFormatWithSampleRate: 16000, channels: 1), let request = try? SNClassifySoundRequest(classifierIdentifier: .version1),
               let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(pcm.count)), !pcm.isEmpty else { return true }
@@ -654,33 +757,57 @@ final class MeetingWhisper: @unchecked Sendable {   // touched on the main threa
         }
         return words.joined(separator: " ")
     }
-    private static let frame = 320   // 20 ms; a frame is loud when any sample passes 0.02
-    private static func loud(_ pcm: ArraySlice<Float>) -> Bool { pcm.contains { abs($0) > 0.02 } }
-    static func hasSpeech(_ pcm: [Float]) -> Bool {   // a quarter second of loud frames: not a key click, not room noise
+    private static let frame = 320   // 20 ms; a frame is loud when any sample passes the stream's level
+    private static func loud(_ pcm: ArraySlice<Float>, _ level: Float) -> Bool { pcm.contains { abs($0) > level } }
+    static func voiced(_ pcm: [Float], level: Float = 0.02) -> Double {   // seconds of loud frames: the pause that closed a line doesn't count
+        Double(stride(from: 0, to: pcm.count, by: frame).filter { loud(pcm[$0..<min(pcm.count, $0 + frame)], level) }.count * frame) / 16000
+    }
+    static func hasSpeech(_ pcm: [Float], level: Float = 0.02) -> Bool {   // a quarter second of loud frames: not a key click, not room noise
         var count = 0, i = 0
-        while i < pcm.count { if loud(pcm[i..<min(pcm.count, i + frame)]) { count += 1; if count >= 12 { return true } }; i += frame }
+        while i < pcm.count { if loud(pcm[i..<min(pcm.count, i + frame)], level) { count += 1; if count >= 12 { return true } }; i += frame }
         return false
     }
     // Where to close: the end of the last pause of at least 0.7 s, and whether anything before it was speech.
-    static func cut(_ pcm: [Float]) -> (end: Int, speech: Bool)? {
+    static func cut(_ pcm: [Float], level: Float = 0.02) -> (end: Int, speech: Bool)? {
         var i = 0, run = 0, end: Int?
         while i + frame <= pcm.count {
-            if loud(pcm[i..<(i + frame)]) { run = 0 } else { run += 1; if run >= 35 { end = i + frame } }
+            if loud(pcm[i..<(i + frame)], level) { run = 0 } else { run += 1; if run >= 35 { end = i + frame } }
             i += frame
         }
-        return end.map { ($0, hasSpeech(Array(pcm[..<$0]))) }
+        return end.map { ($0, hasSpeech(Array(pcm[..<$0]), level: level)) }
+    }
+    private func listen(_ pcm: [Float]) {   // new frames into the minute of peaks; a second of them before the level moves
+        var i = scanned
+        while i + Self.frame <= pcm.count {
+            let peak = pcm[i..<(i + Self.frame)].reduce(0) { max($0, abs($1)) }
+            peaks.append(peak); counts.loudest = max(counts.loudest, peak); counts.seconds += Double(Self.frame) / 16000; i += Self.frame
+        }
+        scanned = i
+        if peaks.count > 3000 { peaks.removeFirst(peaks.count - 3000) }
+        if peaks.count >= 50 { level = Self.level(floor: peaks.sorted()[peaks.count / 10]) }
+    }
+    // One line in app.err per stream when a meeting ends: did audio arrive (seconds), was it ever loud enough (loudest against level),
+    // and did the lower level keep lines from closing at pauses (capped at 30 s, longest).
+    var summary: String {
+        String(format: "%.0f s heard, loudest %.4f, level %.4f, floor %.4f; clips: %d quiet, %d not speech, %d sent, %d with words, %d hit 30 s, longest %.1f s; VAD %@",
+               counts.seconds, counts.loudest, level, peaks.isEmpty ? 0 : peaks.sorted()[peaks.count / 10], counts.quiet, counts.noise, counts.sent, counts.lines,
+               counts.capped, counts.longest, screened() ? "on" : "off")
     }
     func tick() {   // main thread, every 0.25 s
         let pcm = audio.snapshot(), now = Date()
         if pcm.count != seen { seen = pcm.count; grew = now }
+        listen(pcm)
         guard !busy, !pcm.isEmpty else { return }
-        if let c = Self.cut(pcm) { return close(c.end, speech: c.speech) }
+        if let c = Self.cut(pcm, level: level) { return close(c.end, speech: c.speech) }
         // capture can simply stop sending when an app goes quiet, or a line can run long: close what's here
-        if now.timeIntervalSince(grew) >= 0.7 || pcm.count >= 30 * 16000 { return close(pcm.count, speech: Self.hasSpeech(pcm)) }
-        guard Self.running == 0, Self.lastLive !== self || now.timeIntervalSince(Self.freed) >= 0.3, pcm.count - sent >= 8000, now.timeIntervalSince(asked) >= 1, Self.hasSpeech(Array(pcm[max(0, sent - 4000)...])) else { return }
-        ask += 1; let n = ask, hints = hints, lang = language.request; busy = true; asked = now; sent = pcm.count; Self.running += 1; Self.lastLive = self
+        if now.timeIntervalSince(grew) >= 0.7 || pcm.count >= 30 * 16000 {
+            if pcm.count >= 30 * 16000 { counts.capped += 1 }
+            return close(pcm.count, speech: Self.hasSpeech(pcm, level: level))
+        }
+        guard Self.running == 0, Self.lastLive !== self || now.timeIntervalSince(Self.freed) >= 0.3, pcm.count - sent >= 8000, now.timeIntervalSince(asked) >= 1, Self.hasSpeech(Array(pcm[max(0, sent - 4000)...]), level: level) else { return }
+        ask += 1; let n = ask, lang = language.request, hints = words.prompt, pass = pass; busy = true; asked = now; sent = pcm.count; Self.running += 1; Self.lastLive = self
         Task { [weak self] in
-            let r = Self.isSpeech(pcm) ? try? await Whisper.shared.transcribed(pcm, prompt: hints, language: lang) : nil   // a failed live pass only skips a beat
+            let r = Self.isSpeech(pcm) ? try? await pass(pcm, hints, lang, false) : nil   // a failed live pass only skips a beat
             await MainActor.run {
                 Self.running -= 1; Self.freed = Date()
                 guard let self, self.ask == n else { return }
@@ -690,28 +817,90 @@ final class MeetingWhisper: @unchecked Sendable {   // touched on the main threa
         }
     }
     private func close(_ end: Int, speech: Bool) {
-        let pcm = audio.take(end), hints = hints, lang = language.request
-        ask += 1; sent = 0; seen = audio.snapshot().count
-        guard speech else { return }   // silence or noise: Whisper would only invent words for it
-        let n = ask; busy = true; Self.running += 1
+        let total = audio.snapshot().count, now = Date(), from = now.addingTimeInterval(-Double(total) / 16000)
+        let said = EchoGate.Span(start: from, end: from.addingTimeInterval(Double(end) / 16000))
+        counts.longest = max(counts.longest, Double(end) / 16000)
+        let lang = language.request, hints = words.prompt, pcm = audio.take(end), pass = pass, recheck = lang != nil && screened(), level = level
+        ask += 1; sent = 0; seen = audio.snapshot().count; scanned = max(0, scanned - end)
+        guard speech else { counts.quiet += 1; return }   // silence or noise: Whisper would only invent words for it
+        let n = ask; busy = true; Self.running += 1; reading = said.start
         Task { [weak self] in
-            let r: Result<(text: String, language: String?), Error>
-            do { r = .success(Self.isSpeech(pcm) ? try await Whisper.shared.transcribed(pcm, prompt: hints, language: lang) : ("", nil)) } catch { r = .failure(error) }
+            let r: Result<(text: String, language: String?, released: Bool, noise: Bool), Error>
+            do {
+                guard Self.isSpeech(pcm) else { throw CancellationError() }
+                var got = try await pass(pcm, hints, lang, true), released = false
+                // Locked and nothing usable: maybe the lock is wrong. Only with VAD screening, or the open pass over noise brings back
+                // the invented other-language lines; only 2 s of voice and 4+ clear words take over from the lock.
+                if recheck, Whisper.garbled(got.text) {
+                    let other = try await pass(pcm, hints, "auto", true)
+                    if !Whisper.garbled(other.text), other.text.split(separator: " ").count >= 4, Self.voiced(pcm, level: level) >= 2 { got = other; released = true }
+                }
+                r = .success((got.text, got.language, released, false))
+            } catch is CancellationError { r = .success(("", nil, false, true)) } catch { r = .failure(error) }
             await MainActor.run {
                 Self.running -= 1; Self.freed = Date()
                 guard let self, self.ask == n else { return }
-                self.busy = false
+                self.busy = false; self.reading = nil; self.span = said
                 switch r {
                 case .success(let got):
                     let text = self.clean(got.text); self.fails = 0
-                    if !text.isEmpty { self.language.note(got.language, seconds: Double(pcm.count) / 16000) }
+                    if got.noise { self.counts.noise += 1 } else { self.counts.sent += 1 }
+                    if !text.isEmpty { self.counts.lines += 1 }
+                    if got.released { self.language.release() }
+                    if !text.isEmpty, !Whisper.garbled(got.text) { self.language.note(got.language, seconds: Double(pcm.count) / 16000) }
                     self.heard(text, true)
                 case .failure(let e): self.fails += 1; if self.fails >= 3 { self.failed(e.localizedDescription) }
                 }
             }
         }
     }
-    func reset() { audio.reset(); ask += 1; busy = false; sent = 0; seen = 0 }   // drops what's buffered and any pass still running
+    func reset() { audio.reset(); ask += 1; busy = false; sent = 0; seen = 0; scanned = 0; reading = nil }   // drops what's buffered and any pass still running
+}
+// Without headphones the mic hears the call from the speakers, so the same words land on both streams (after Yogurt's echo.ts, MIT).
+// A mic line waits until the call stream has transcribed past it (at most 6 s), then goes on unless it is a call line said at the
+// same moment: 80% of the mic line, word for word and in order, inside one of their lines (or two, when Whisper cut it there).
+// Yogurt also checks that the mic's audio followed the call's; without that check this is stricter than its bag of shared words:
+// Vietnamese words are syllables, so a short reply like "em làm rồi" shares every word with a long line easily, but not in a row.
+// Lines under 6 words and acknowledgements (dạ, vâng, ok) always stay: a missed echo is a duplicate, a dropped line is lost.
+final class EchoGate {   // main thread only
+    struct Span { let start, end: Date }
+    private var call: [(text: String, span: Span)] = []
+    private var held: [(text: String, span: Span, since: Date, deliver: (String) -> Void)] = []
+    private(set) var dropped = 0
+    static let ack: Set<String> = ["yeah", "yes", "yep", "no", "nope", "right", "okay", "ok", "sure", "exactly", "true", "agreed", "fine", "great", "good",
+        "thanks", "thank", "you", "please", "sorry", "correct", "cool", "perfect", "hi", "hello", "bye", "alright", "well", "so", "and", "but", "i", "me", "too", "also",
+        "dạ", "vâng", "ừ", "ừm", "ờ", "à", "ạ", "rồi", "đúng", "được", "okê", "oke", "cảm", "ơn", "em", "anh", "chị", "nhé", "nha", "không", "có", "vậy", "thế", "luôn"]
+    static func tokens(_ s: String) -> [String] { s.lowercased().split(whereSeparator: { !$0.isLetter && !$0.isNumber }).map(String.init) }
+    static func run(_ a: [String], _ b: [String]) -> Int {   // the longest stretch of a found word for word, in order, in b
+        var best = 0
+        for i in a.indices { for j in b.indices {
+            var n = 0
+            while i + n < a.count, j + n < b.count, a[i + n] == b[j + n] { n += 1 }
+            best = max(best, n)
+        } }
+        return best
+    }
+    static func echo(_ text: String, _ m: Span, of them: [(text: String, span: Span)]) -> Bool {
+        let mine = tokens(text)
+        guard mine.count >= 6, !mine.allSatisfy(ack.contains) else { return false }
+        // their lines it could copy: around the same time, and begun before their line (and the speakers' half-second tail) ended
+        let near = them.filter { m.start <= $0.span.end.addingTimeInterval(1.5) && m.end >= $0.span.start.addingTimeInterval(-1.5) && m.start < $0.span.end.addingTimeInterval(0.5) && tokens($0.text).count >= 3 }
+        let need = Int((Double(mine.count) * 0.8).rounded(.up))
+        return near.contains { run(mine, tokens($0.text)) >= need } || near.count > 1 && run(mine, tokens(near.map(\.text).joined(separator: " "))) >= need
+    }
+    func heardCall(_ text: String, _ span: Span) {
+        guard !text.isEmpty else { return }
+        call.append((text, span)); call.removeAll { span.end.timeIntervalSince($0.span.end) > 60 }
+    }
+    func mic(_ text: String, _ span: Span, now: Date = Date(), deliver: @escaping (String) -> Void) { held.append((text, span, now, deliver)) }
+    func release(callThrough: Date, now: Date = Date()) {   // in order: a later line never jumps one still waiting
+        while let h = held.first, callThrough >= h.span.end || now.timeIntervalSince(h.since) >= 6 {
+            held.removeFirst()
+            let copy = !h.text.isEmpty && Self.echo(h.text, h.span, of: call)
+            if copy { dropped += 1 }
+            h.deliver(copy ? "" : h.text)   // empty still closes the live words the line was showing
+        }
+    }
 }
 // MARK: end Whisper
 func microphoneChoices() -> [[String: String]] { microphones().map { ["uid": $0.uid, "name": $0.name] } }
@@ -6270,7 +6459,7 @@ func meetingCalendarContext(_ done: @escaping ([String: Any]?, String?) -> Void)
 final class MeetingCopilot: NSObject, WKScriptMessageHandler {
     var panel: KeyPanel?, web: WKWebView?, audio: MeetingAudio?, analyzer: SpeechAnalyzer?, reading: Task<Void, Never>?, starting: Task<Void, Never>?
     var micAnalyzer: SpeechAnalyzer?, micReading: Task<Void, Never>?, analyzing: Task<Void, Never>?, micAnalyzing: Task<Void, Never>?, stopping: Task<Void, Never>?
-    var callWhisper: MeetingWhisper?, micWhisper: MeetingWhisper?, whisperTimer: Timer?
+    var callWhisper: MeetingWhisper?, micWhisper: MeetingWhisper?, whisperTimer: Timer?, echoGate: EchoGate?
     var micPending = "", micPartial = "", micSettle: DispatchWorkItem?, elapsed: TimeInterval = 0
     var partialQuestion: Int?, micPartialQuestion: Int?
     var voice = false, voiceText = "", voicePartial = "", voiceTail = Date.distantPast   // talking to Atticus: your mic goes to the ask box, not the transcript
@@ -6558,12 +6747,29 @@ final class MeetingCopilot: NSObject, WKScriptMessageHandler {
     }
     // Settings → Speech model → Whisper: both streams go to the local whisper-server, in the language picked there.
     func startWhisper(_ g: Int) {
-        let hints = [meetingTitle, name].filter { !$0.isEmpty }.joined(separator: ", ")
+        var people = [name]   // you, and the others on this meeting's calendar event when it's the one being recorded
+        if !meetingTitle.isEmpty, EKEventStore.authorizationStatus(for: .event) == .fullAccess, let event = currentMeetingEvent(calendar), event["title"] as? String == meetingTitle {
+            people += (event["attendees"] as? [String] ?? []).map { String($0.split(separator: "<").first ?? "").trimmingCharacters(in: .whitespaces) }.filter { !$0.contains("@") }
+        }
+        let hints = MeetingWords(title: meetingTitle, names: people, words: DictationData.words)
         let lost = { [weak self] (why: String) in if self?.generation == g && self?.running == true { self?.stop(); self?.js("error", "Whisper stopped: \(why) Resume to try again.") } }
-        let language = MeetingLanguage()
-        callWhisper = MeetingWhisper(hints: hints, language: language, heard: { [weak self] text, final in if self?.generation == g { self?.speech(text, final: final) } }, failed: lost)
-        micWhisper = MeetingWhisper(hints: hints, language: language, heard: { [weak self] text, final in if self?.generation == g { self?.speech(text, final: final, mic: true) } }, failed: lost)
-        whisperTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in self?.callWhisper?.tick(); self?.micWhisper?.tick() }
+        let echo = EchoGate(); echoGate = echo
+        callWhisper = MeetingWhisper(words: hints, language: MeetingLanguage(), heard: { [weak self] text, final in
+            guard let self, generation == g else { return }
+            if final, let span = callWhisper?.span { echo.heardCall(text, span) }
+            speech(text, final: final)
+        }, failed: lost)
+        micWhisper = MeetingWhisper(words: hints, language: MeetingLanguage(), heard: { [weak self] text, final in
+            guard let self, generation == g else { return }
+            // a voice ask is your own words to Atticus: never held back
+            if final, !voice, let span = micWhisper?.span { echo.mic(text, span) { [weak self] t in if self?.generation == g { self?.speech(t, final: true, mic: true) } } }
+            else { speech(text, final: final, mic: true) }
+        }, failed: lost)
+        whisperTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            callWhisper?.tick(); micWhisper?.tick()
+            echo.release(callThrough: callWhisper?.through ?? .distantFuture)
+        }
     }
     func speech(_ piece: String, final: Bool, mic: Bool = false) {
         guard running else { return }
@@ -6804,10 +7010,12 @@ final class MeetingCopilot: NSObject, WKScriptMessageHandler {
         if !running && (nudge != nil || transcript.isEmpty) { return discard() }   // pause or switch-off during a card: just close it
         guard running else { return }
         voice = false; voiceText = ""; voicePartial = ""
+        echoGate?.release(callThrough: .distantFuture)   // mic lines still waiting on the call go out as they are, before the last flush
         pending += " " + partial; partial = ""; micPending += " " + micPartial; micPartial = ""
         flush(answer: false); flush(answer: false, mic: true); elapsed = Date().timeIntervalSince(began); running = false; minimized = false; generation += 1; starting?.cancel(); starting = nil; settle?.cancel(); micSettle?.cancel(); timer?.invalidate(); timer = nil
         cancelWork(); reading?.cancel(); reading = nil; micReading?.cancel(); micReading = nil
-        whisperTimer?.invalidate(); whisperTimer = nil; callWhisper = nil; micWhisper = nil
+        if let c = callWhisper, let m = micWhisper { NSLog("Whisper meeting, call: %@", c.summary); NSLog("Whisper meeting, mic: %@; %d echo lines dropped", m.summary, echoGate?.dropped ?? 0) }
+        whisperTimer?.invalidate(); whisperTimer = nil; callWhisper = nil; micWhisper = nil; echoGate = nil
         analyzing?.cancel(); analyzing = nil; micAnalyzing?.cancel(); micAnalyzing = nil
         let capture = audio, an = analyzer, micAn = micAnalyzer; audio = nil; analyzer = nil; micAnalyzer = nil
         stopping = Task { await capture?.stop(); await an?.cancelAndFinishNow(); await micAn?.cancelAndFinishNow() }
@@ -6885,6 +7093,7 @@ final class MeetingCopilot: NSObject, WKScriptMessageHandler {
             guard running else { return }
             if b["on"] as? Bool == true {
                 guard micAnalyzer != nil || micWhisper != nil, !demo else { js("voiceEnd"); js("error", "Voice asks need the microphone"); return }
+                echoGate?.release(callThrough: .distantFuture)   // held mic lines belong to the meeting, not to the ask that starts now
                 micPending += " " + micPartial; micPartial = ""; flush(answer: false, mic: true); voice = true; voiceText = ""; voicePartial = ""; micWhisper?.reset()
             } else if voice { voice = false; voiceText = ""; voicePartial = ""; voiceTail = Date().addingTimeInterval(1.5); micWhisper?.reset() }
         case "pause": stop(paused: true)
