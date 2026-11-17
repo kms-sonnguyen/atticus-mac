@@ -57,6 +57,15 @@ class ArchiveTests(unittest.TestCase):
         result = atticus.meeting_command({'action': 'delete', 'id': 'fake-call'})
         self.assertEqual(result['deleted'], 'fake-call'); self.assertFalse(self.folder.exists())
 
+    def test_export_lists_lines_in_the_order_they_were_said(self):
+        # a mic line is stamped when said but can be saved after the call's answer to it
+        atticus.meeting_append('fake-call', {'kind': 'transcript', 'text': 'Dạ có nhá.', 'speaker': 'Them', 'seconds': 5288})
+        atticus.meeting_append('fake-call', {'kind': 'transcript', 'text': 'Ai sẽ review code của em?', 'speaker': 'You', 'seconds': 5258})
+        atticus.meeting_append('fake-call', {'kind': 'transcript', 'text': 'Thường thì ba người.', 'speaker': 'Them', 'seconds': 5288})
+        md = atticus.meeting_markdown(atticus.meeting_read('fake-call'))
+        self.assertLess(md.index('Ai sẽ review'), md.index('Dạ có nhá'))
+        self.assertLess(md.index('Dạ có nhá'), md.index('Thường thì'))   # same second: saved order
+
     def test_summary_reads_the_transcript_once_only_when_switched_on(self):
         atticus.meeting_append('fake-call', {'kind': 'transcript', 'text': 'We agreed on the budget', 'seconds': 10})
         quiet = self.root / 'meetings' / 'quiet-call'; quiet.mkdir(mode=0o700)

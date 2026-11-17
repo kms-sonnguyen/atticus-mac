@@ -364,6 +364,10 @@ final class WhisperAudio: @unchecked Sendable {
 
 // Owns one whisper-server on a free 127.0.0.1 port. A tiny sh wrapper kills it when Atticus dies (no orphans);
 // 10 idle minutes stop it too (up to 1.6 GB), and the next key-down starts it again in ~0.4 s.
+// Timestamps stay on (no -nt): without them whisper.cpp moves a full 30 s window after each pass, so in a clip over 30 s
+// whatever the decoder hadn't reached when it stopped is skipped. With beam search a 38 s Vietnamese clip lost a whole sentence at the
+// window's edge (all of it with timestamps); a 22 s clip was the same either way. Meeting lines run to 30 s and past it while the pass
+// before them is still out (44 times, up to 41 s, in a 2-hour meeting). The text field has no timestamps either way.
 final class Whisper: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
     static let shared = Whisper()
     struct Model { let id, name, file, sha256: String; let bytes: Int64 }
@@ -506,7 +510,7 @@ final class Whisper: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
         if !vad { fetchVad() }   // the server after this one screens
         let p = Process(); p.executableURL = URL(fileURLWithPath: "/bin/sh")
         p.arguments = ["-c", """
-            "$0" -m "$1" --host 127.0.0.1 --port \(free) -t \(Self.threads) -nt \(vad ? "-vm \"$2\"" : "") & s=$!
+            "$0" -m "$1" --host 127.0.0.1 --port \(free) -t \(Self.threads) \(vad ? "-vm \"$2\"" : "") & s=$!
             trap 'kill $s 2>/dev/null; exit 0' TERM INT
             while kill -0 \(getpid()) 2>/dev/null && kill -0 $s 2>/dev/null; do sleep 1 & wait $!; done
             kill $s 2>/dev/null
@@ -593,10 +597,9 @@ final class Whisper: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
         }
         // segments Whisper itself rates as probably not speech are its hallucinations
         let segments = json["segments"] as? [[String: Any]] ?? []
-        let text = segments.isEmpty ? json["text"] as? String ?? ""
-            : segments.filter { ($0["no_speech_prob"] as? Double ?? 0) < 0.6 }.compactMap { $0["text"] as? String }
-                .filter { !meeting || !Self.promptEcho($0, prompt) }.map { Self.withoutInvented($0) }.joined(separator: " ")
-        let said = text.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        let said = segments.isEmpty ? Self.said([json["text"] as? String ?? ""])
+            : Self.said(segments.filter { ($0["no_speech_prob"] as? Double ?? 0) < 0.6 }.compactMap { $0["text"] as? String }
+                .filter { !meeting || !Self.promptEcho($0, prompt) })
         guard meeting else { return (said, json["detected_language"] as? String) }
         // no probabilities: the language the pass decoded in, which means nothing when nothing was heard (an empty pass says English)
         let decoded = said.isEmpty ? nil : json["language"] as? String
@@ -619,6 +622,12 @@ final class Whisper: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
         } }
         return run == t.count || run >= 4 && t.count - run <= 1
     }
+    // Segment texts come untrimmed: a segment that starts a word starts with its space, and one that breaks inside a word ("đ" + "úng",
+    // "ti" + "ết") doesn't, so they join with nothing between. A sign-off cut off a segment keeps the segment's own leading space.
+    static func said(_ segments: [String]) -> String {
+        segments.map { String($0.prefix(while: \.isWhitespace)) + withoutInvented($0) }.joined()
+            .split(whereSeparator: \.isWhitespace).joined(separator: " ")
+    }
     // Yogurt's test (MIT, FrigadeHQ/yogurt asr/transcribe.ts): empty, or 8+ words that are mostly the same few. Whisper lost its
     // way, usually because it was told the wrong language.
     static func garbled(_ text: String) -> Bool {
@@ -628,7 +637,8 @@ final class Whisper: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
     // Closing lines of the videos Whisper trained on, which it invents over noise and no_speech_prob doesn't catch. They can stick to the
     // end of real speech with no full stop between, so the text is cut from the first one on, never dropped whole.
     static func withoutInvented(_ text: String) -> String {
-        let phrases = ["hãy subscribe", "subscribe cho kênh", "để không bỏ lỡ những video", "không bỏ lỡ những video", "cảm ơn các bạn đã theo dõi", "hẹn gặp lại các bạn trong",
+        let phrases = ["hãy subscribe", "subscribe cho kênh", "để không bỏ lỡ những video", "không bỏ lỡ những video", "những video hấp dẫn", "video hấp dẫn", "cảm ơn các bạn đã theo dõi", "hẹn gặp lại các bạn trong",
+                       "các bạn hãy đăng k", "mọi người hãy đăng k", "đăng kí cho kênh", "đăng ký cho kênh", "đăng kí kênh", "đăng ký kênh", "nhấn vào phần bình luận",
                        "thank you for watching", "thanks for watching", "please subscribe", "subscribe to my channel", "that's it for this video", "if you enjoyed this video", "undertekster", "amara.org"]
         let hit = phrases.compactMap { text.range(of: $0, options: [.caseInsensitive, .diacriticInsensitive]) }.map(\.lowerBound).min()
         return hit.map { String(text[..<$0]).trimmingCharacters(in: .whitespaces) } ?? text
@@ -698,12 +708,16 @@ final class MeetingWhisper: @unchecked Sendable {   // touched on the main threa
     private let words: MeetingWords, heard: (String, Bool) -> Void, failed: (String) -> Void, language: MeetingLanguage, pass: Pass, screened: () -> Bool
     private var busy = false, ask = 0, sent = 0, asked = Date.distantPast, fails = 0, seen = 0, grew = Date()
     private var recent: [(text: String, at: Date)] = []
+    // The last live words and how much of the buffer they covered. When the final for that audio comes back with under half their
+    // words (a skipped stretch, or a sign-off in place of speech), the live words are kept instead: 8 lines in a real meeting were
+    // "subscribe" lines over 10+ live words of real answer. Only when the live pass read no further than the line, or they'd repeat.
+    private var live = (text: "", upTo: 0)
     // This stream's loudness (after Yogurt's chunker, MIT): a frame is loud over 3x the stream's noise floor, the quietest tenth of
     // its 20 ms frame peaks over the last minute, kept between 0.005 and the old fixed 0.02. A quiet headset peaks near 0.01 and
     // never passed 0.02; Whisper and the VAD read speech down to 0.006. Apple's classifier still decides voice from noise.
     private var peaks: [Float] = [], scanned = 0
     private(set) var level: Float = 0.02
-    private(set) var counts = (loudest: Float(0), seconds: 0.0, quiet: 0, noise: 0, sent: 0, lines: 0, capped: 0, longest: 0.0)   // for the log when the meeting ends
+    private(set) var counts = (loudest: Float(0), seconds: 0.0, quiet: 0, noise: 0, sent: 0, lines: 0, capped: 0, longest: 0.0, kept: 0)   // for the log when the meeting ends
     // When the final line just heard was said, on the wall clock (audio arrives in real time), and where a final still being read starts
     private(set) var span: EchoGate.Span?
     private var reading: Date?
@@ -789,9 +803,9 @@ final class MeetingWhisper: @unchecked Sendable {   // touched on the main threa
     // One line in app.err per stream when a meeting ends: did audio arrive (seconds), was it ever loud enough (loudest against level),
     // and did the lower level keep lines from closing at pauses (capped at 30 s, longest).
     var summary: String {
-        String(format: "%.0f s heard, loudest %.4f, level %.4f, floor %.4f; clips: %d quiet, %d not speech, %d sent, %d with words, %d hit 30 s, longest %.1f s; VAD %@",
+        String(format: "%.0f s heard, loudest %.4f, level %.4f, floor %.4f; clips: %d quiet, %d not speech, %d sent, %d with words, %d hit 30 s, longest %.1f s, %d kept live words; VAD %@",
                counts.seconds, counts.loudest, level, peaks.isEmpty ? 0 : peaks.sorted()[peaks.count / 10], counts.quiet, counts.noise, counts.sent, counts.lines,
-               counts.capped, counts.longest, screened() ? "on" : "off")
+               counts.capped, counts.longest, counts.kept, screened() ? "on" : "off")
     }
     func tick() {   // main thread, every 0.25 s
         let pcm = audio.snapshot(), now = Date()
@@ -812,7 +826,7 @@ final class MeetingWhisper: @unchecked Sendable {   // touched on the main threa
                 Self.running -= 1; Self.freed = Date()
                 guard let self, self.ask == n else { return }
                 self.busy = false
-                if let r { let text = self.clean(r.text, remember: false); if !text.isEmpty { self.heard(text, false) } }
+                if let r { let text = self.clean(r.text, remember: false); if !text.isEmpty { self.live = (r.text, pcm.count); self.heard(text, false) } }
             }
         }
     }
@@ -821,6 +835,7 @@ final class MeetingWhisper: @unchecked Sendable {   // touched on the main threa
         let said = EchoGate.Span(start: from, end: from.addingTimeInterval(Double(end) / 16000))
         counts.longest = max(counts.longest, Double(end) / 16000)
         let lang = language.request, hints = words.prompt, pcm = audio.take(end), pass = pass, recheck = lang != nil && screened(), level = level
+        let draft = live.upTo <= end ? live.text : ""; live = ("", 0)
         ask += 1; sent = 0; seen = audio.snapshot().count; scanned = max(0, scanned - end)
         guard speech else { counts.quiet += 1; return }   // silence or noise: Whisper would only invent words for it
         let n = ask; busy = true; Self.running += 1; reading = said.start
@@ -842,7 +857,8 @@ final class MeetingWhisper: @unchecked Sendable {   // touched on the main threa
                 guard let self, self.ask == n else { return }
                 self.busy = false; self.reading = nil; self.span = said
                 switch r {
-                case .success(let got):
+                case .success(var got):
+                    if !got.noise, Self.keepsDraft(final: self.clean(got.text, remember: false), draft: draft) { got.text = draft; self.counts.kept += 1 }
                     let text = self.clean(got.text); self.fails = 0
                     if got.noise { self.counts.noise += 1 } else { self.counts.sent += 1 }
                     if !text.isEmpty { self.counts.lines += 1 }
@@ -854,7 +870,12 @@ final class MeetingWhisper: @unchecked Sendable {   // touched on the main threa
             }
         }
     }
-    func reset() { audio.reset(); ask += 1; busy = false; sent = 0; seen = 0; scanned = 0; reading = nil }   // drops what's buffered and any pass still running
+    // 8+ clear live words with no sign-off in them (live words are Whisper too), and the final kept under half of them
+    static func keepsDraft(final: String, draft: String) -> Bool {
+        let count = { (s: String) in s.split(whereSeparator: \.isWhitespace).count }
+        return count(draft) >= 8 && !Whisper.garbled(draft) && Whisper.withoutInvented(draft) == draft.trimmingCharacters(in: .whitespaces) && count(final) * 2 < count(draft)
+    }
+    func reset() { audio.reset(); ask += 1; busy = false; sent = 0; seen = 0; scanned = 0; reading = nil; live = ("", 0) }   // drops what's buffered and any pass still running
 }
 // Without headphones the mic hears the call from the speakers, so the same words land on both streams (after Yogurt's echo.ts, MIT).
 // A mic line waits until the call stream has transcribed past it (at most 6 s), then goes on unless it is a call line said at the
@@ -6474,6 +6495,13 @@ final class MeetingCopilot: NSObject, WKScriptMessageHandler {
     var moveMonitor: Any?, screenObserver: NSObjectProtocol?, mouseDown: NSPoint?, dragOrigin: NSRect?, dragging = false
     var archive: MeetingArchive?, archiveEnded = false, meetingTitle = "", callApp = "Call"
     var room: Bool { callApp == "In person" }   // no call: the mic hears everyone, so its questions get answers too
+    // In person, but the call audio talks: it's a call after all (no call app held the mic when it started, or a browser call).
+    // Two call lines of 4+ words decide it; from then on your mic is You and the call is Them, the split a call would get.
+    var callLines = 0
+    var alone: Bool { room && callLines < 2 }
+    // When the first words of each stream's waiting line were said: a line is stamped then, not when it settles. A mic line can wait
+    // on the echo gate for seconds, which put your question after the answer to it.
+    var pendingAt: Date?, micPendingAt: Date?
     var style: String {   // the answer style picked on the prep screen, read per answer so Settings edits apply mid-call
         let pick = Prefs.str("meetingStyle")
         if pick == "Custom…" { return Prefs.str("meetingCustom") }
@@ -6491,6 +6519,7 @@ final class MeetingCopilot: NSObject, WKScriptMessageHandler {
             panel.orderFrontRegardless(); focus(); return
         }
         self.demo = demo; self.nudge = nudge; minimized = false; loaded = false; generation += 1; transcript = []; brief = ""; pending = ""; partial = ""; micPending = ""; micPartial = ""; elapsed = 0; serial = 0
+        callLines = 0; pendingAt = nil; micPendingAt = nil
         archive = nil; archiveEnded = false; meetingTitle = nudge?["context"] as? String == "" ? "" : nudge?["title"] as? String ?? ""; callApp = nudge?["app"] as? String ?? "Call"
         let config = (Prefs.path as NSString).deletingLastPathComponent
         name = profileName(config + "/me.json")
@@ -6756,14 +6785,15 @@ final class MeetingCopilot: NSObject, WKScriptMessageHandler {
         let echo = EchoGate(); echoGate = echo
         callWhisper = MeetingWhisper(words: hints, language: MeetingLanguage(), heard: { [weak self] text, final in
             guard let self, generation == g else { return }
-            if final, let span = callWhisper?.span { echo.heardCall(text, span) }
-            speech(text, final: final)
+            let span = final ? callWhisper?.span : nil
+            if let span { echo.heardCall(text, span) }
+            speech(text, final: final, at: span?.start)
         }, failed: lost)
         micWhisper = MeetingWhisper(words: hints, language: MeetingLanguage(), heard: { [weak self] text, final in
             guard let self, generation == g else { return }
             // a voice ask is your own words to Atticus: never held back
-            if final, !voice, let span = micWhisper?.span { echo.mic(text, span) { [weak self] t in if self?.generation == g { self?.speech(t, final: true, mic: true) } } }
-            else { speech(text, final: final, mic: true) }
+            if final, !voice, let span = micWhisper?.span { echo.mic(text, span) { [weak self] t in if self?.generation == g { self?.speech(t, final: true, mic: true, at: span.start) } } }
+            else { speech(text, final: final, mic: true, at: final ? micWhisper?.span?.start : nil) }
         }, failed: lost)
         whisperTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
             guard let self else { return }
@@ -6771,29 +6801,31 @@ final class MeetingCopilot: NSObject, WKScriptMessageHandler {
             echo.release(callThrough: callWhisper?.through ?? .distantFuture)
         }
     }
-    func speech(_ piece: String, final: Bool, mic: Bool = false) {
+    func speech(_ piece: String, final: Bool, mic: Bool = false, at: Date? = nil) {
         guard running else { return }
+        if final, !mic, piece.split(whereSeparator: \.isWhitespace).count >= 4 { callLines += 1 }
         if mic && voice {
             if final { voiceText += " " + piece; voicePartial = "" } else { voicePartial = piece }
             return js("heard", (voiceText + " " + voicePartial).trimmingCharacters(in: .whitespaces))
         }
         if mic && Date() < voiceTail { return }   // the last words of a voice ask finishing; already in the ask
         if mic { micPartial = final ? "" : piece } else { partial = final ? "" : piece }
-        js("partial", ["mic": mic && !room, "text": final ? "" : piece])
-        let clearlyQuestion = !final && (!mic || room) && piece.trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix("?")
+        js("partial", ["mic": mic && !alone, "text": final ? "" : piece])
+        let clearlyQuestion = !final && (!mic || alone) && piece.trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix("?")
         if clearlyQuestion && (mic ? micPartialQuestion : partialQuestion) == nil && Prefs.str("meetingAuto") != "ask" {
             serial += 1
             if mic { micPartialQuestion = serial } else { partialQuestion = serial }
             let now = Date().timeIntervalSince1970
-            let askedBy = room ? "Someone in the room" : callApp == "Call" ? "Someone else" : "Someone on " + callApp
+            let askedBy = alone && mic ? "Someone in the room" : callApp == "Call" || room ? "Someone else" : "Someone on " + callApp
             let row: [String: Any] = ["id": serial, "text": piece, "seconds": Int(Date().timeIntervalSince(began)), "speaker": askedBy]
             js("question", row.merging(["auto": true, "heard": true]) { $1 })
             enqueue(serial, piece, best: Prefs.str("meetingAuto") == "always", at: now, detectedAt: now)
         }
-        if final { heard(piece, mic: mic) }
+        if final { heard(piece, mic: mic, at: at) }
     }
-    func heard(_ piece: String, mic: Bool = false) {
-        if mic { micPending += " " + piece; micSettle?.cancel() } else { pending += " " + piece; settle?.cancel() }
+    func heard(_ piece: String, mic: Bool = false, at: Date? = nil) {
+        let at = piece.allSatisfy(\.isWhitespace) ? nil : at   // an empty final says nothing about when the next words were said
+        if mic { micPendingAt = micPendingAt ?? at; micPending += " " + piece; micSettle?.cancel() } else { pendingAt = pendingAt ?? at; pending += " " + piece; settle?.cancel() }
         if (mic ? micPending : pending).trimmingCharacters(in: .whitespacesAndNewlines).last.map({ "?.!".contains($0) }) == true { flush(mic: mic) }
         else {
             let item = DispatchWorkItem { [weak self] in self?.flush(mic: mic) }
@@ -6802,18 +6834,19 @@ final class MeetingCopilot: NSObject, WKScriptMessageHandler {
         }
     }
     func flush(answer: Bool = true, mic: Bool = false) {
-        let text = (mic ? micPending : pending).trimmingCharacters(in: .whitespacesAndNewlines)
-        if mic { micPending = "" } else { pending = "" }
+        let text = (mic ? micPending : pending).trimmingCharacters(in: .whitespacesAndNewlines), said = mic ? micPendingAt : pendingAt
+        if mic { micPending = ""; micPendingAt = nil } else { pending = ""; pendingAt = nil }
         guard running, !text.isEmpty else { return }
-        let at = Date().timeIntervalSince1970, you = mic && !room
+        let at = Date().timeIntervalSince1970, you = mic && !alone, seconds = max(0, Int((said ?? Date()).timeIntervalSince(began)))
         let candidate = mic ? micPartialQuestion : partialQuestion
         if mic { micPartialQuestion = nil } else { partialQuestion = nil }
         if candidate == nil { serial += 1 }
-        let id = candidate ?? serial, speaker = you ? "You" : room ? "Room" : callApp == "Call" ? "Them" : callApp
-        let askedBy = you ? "You" : room ? "Someone in the room" : callApp == "Call" ? "Someone else" : "Someone on " + callApp
-        transcript.append(["at": at, "text": text, "seconds": Int(Date().timeIntervalSince(began)), "mic": you])
-        saveEvent(["kind": "transcript", "at": at, "text": text, "seconds": Int(Date().timeIntervalSince(began)), "mic": you, "speaker": speaker])
-        let row: [String: Any] = ["id": id, "text": text, "seconds": Int(Date().timeIntervalSince(began)), "mic": you, "speaker": askedBy]
+        // the call stream is never the room: only your mic, before two call lines show it's a call, is everyone in it
+        let id = candidate ?? serial, inRoom = alone && mic, speaker = you ? "You" : inRoom ? "Room" : callApp == "Call" || room ? "Them" : callApp
+        let askedBy = you ? "You" : inRoom ? "Someone in the room" : callApp == "Call" || room ? "Someone else" : "Someone on " + callApp
+        transcript.append(["at": at, "text": text, "seconds": seconds, "mic": you])
+        saveEvent(["kind": "transcript", "at": at, "text": text, "seconds": seconds, "mic": you, "speaker": speaker])
+        let row: [String: Any] = ["id": id, "text": text, "seconds": seconds, "mic": you, "speaker": askedBy]
         js("line", row)
         if answer && !you {
             if let index = queue.firstIndex(where: { $0["id"] as? Int == id }) {
@@ -7025,7 +7058,7 @@ final class MeetingCopilot: NSObject, WKScriptMessageHandler {
         focus()
     }
     func discard() {
-        if running { stop(paused:true) }; finishArchive(summarize:false); archive = nil; generation += 1; cancelWork(); transcript = []; brief = ""; pending = ""; partial = ""
+        if running { stop(paused:true) }; finishArchive(summarize:false); archive = nil; generation += 1; cancelWork(); transcript = []; brief = ""; pending = ""; partial = ""; pendingAt = nil; micPendingAt = nil; callLines = 0
         if let moveMonitor { NSEvent.removeMonitor(moveMonitor) }; moveMonitor = nil; dragOrigin = nil; mouseDown = nil
         if let screenObserver { NotificationCenter.default.removeObserver(screenObserver) }; screenObserver = nil
         nudge = nil; panel?.orderOut(nil); web?.configuration.userContentController.removeScriptMessageHandler(forName: "meeting"); web = nil; panel = nil

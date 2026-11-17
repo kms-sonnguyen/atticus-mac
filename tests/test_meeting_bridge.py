@@ -55,7 +55,7 @@ meeting.calendarContext = { done in done(["title":"Pilot review","time":"Today a
 let nsapp = NSApplication.shared
 nsapp.setActivationPolicy(.accessory)
 var stage = 0, tries = 0, timedStage = 0, stageStarts: [String] = [], savedFrame = NSRect.zero, latencyReady = Date.distantPast
-var cancelledFinishes: [Process] = []
+var cancelledFinishes: [Process] = [], roomCallFolder = ""
 func fail(_ message: String) -> Never { print(message); meeting.discard(); exit(1) }
 func evaluate(_ script: String, _ done: @escaping (Any?) -> Void) {
  meeting.web?.evaluateJavaScript(script) { value, error in
@@ -242,6 +242,21 @@ Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { _ in
   meeting.open();stage=19
  case 19:
   guard meeting.loaded else { return }
+  // In person, but the call audio talks (13 Nov 2026: a browser call recorded as In person): after two call lines your mic is You.
+  // Lines are stamped when said: your question held 30 s (echo gate, long clip) still sorts before the answer it got.
+  meeting.callApp="In person";meeting.start("Room that is a call");meeting.began=Date().addingTimeInterval(-100)
+  meeting.speech("Ok.",final:true,mic:true)
+  meeting.speech("Dạ có nhá, trong team của em thì có review.",final:true);meeting.speech("Thường thì sẽ có ba người review code.",final:true)
+  meeting.speech("Ai sẽ review code của em?",final:true,mic:true,at:Date().addingTimeInterval(-30))
+  let lines=meeting.transcript.map { ($0["text"] as? String ?? "", $0["mic"] as? Bool ?? true, $0["seconds"] as? Int ?? -1) }
+  guard lines.count==4, !lines[0].1, !lines[1].1, lines[3].1, lines[3].0.hasPrefix("Ai sẽ") else { fail("Room lines not split by stream: \(lines)") }
+  guard (69...71).contains(lines[3].2), (99...101).contains(lines[1].2) else { fail("Lines not stamped when said: \(lines)") }
+  roomCallFolder=meeting.archive!.folder;meeting.stop();meeting.callApp="Call";stage=27
+ case 27:   // that End's recap starts once its write lands; the next start cancels it
+  guard meeting.finishing != nil else { return }
+  // the call stream is never the room, even before two lines prove it's a call (17 Nov 2026: the first line read "Room")
+  let saved=(try! String(contentsOfFile:roomCallFolder+"/events.jsonl", encoding:.utf8)).split(separator:"\\n").compactMap { try? JSONSerialization.jsonObject(with:Data($0.utf8)) as? [String:Any] }.filter { $0["kind"] as? String == "transcript" }.map { $0["speaker"] as? String ?? "" }
+  guard saved == ["Room","Them","Them","You"] else { fail("In person speakers: \(saved)") }
   meeting.start("Failed journal fixture");try! meeting.archive!.handle.close();meeting.stop();stage=26
  case 26:   // the failed End write reports back on the main queue
   guard meeting.archive == nil else { return }

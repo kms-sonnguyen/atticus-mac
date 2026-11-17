@@ -7549,7 +7549,8 @@ def meeting_markdown(m):
         lines += ['', '## Copilot answers', '']
         for row in m['answers']: lines += [str(row.get('question', '')), '\n'.join(row.get('lines', [])), '']
     lines += ['', '## Transcript', '']
-    for row in m['transcript']:
+    # lines are stamped when they were said, and a mic line can settle after the call's answer to it: in order of saying
+    for row in sorted(m['transcript'], key=lambda r: int(r.get('seconds', 0))):
         seconds = int(row.get('seconds', 0))
         lines.append(f"[{seconds // 3600:02d}:{seconds // 60 % 60:02d}:{seconds % 60:02d}] {row.get('speaker', 'Them')}: {row['text']}")
     return '\n'.join(lines) + '\n'

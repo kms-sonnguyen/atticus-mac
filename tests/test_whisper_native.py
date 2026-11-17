@@ -224,6 +224,10 @@ eq(m.clean("chị sẽ pin cái information đó thì mình sẽ pick up những
 eq(m.clean("mấy cái component này cũng cần thiết thôi Hẹn gặp lại các bạn trong những video tiếp theo.", at: t), "mấy cái component này cũng cần thiết thôi")
 eq(m.clean("Please subscribe to my channel.", at: t), "")
 eq(m.clean("Hãy subscribe cho kênh Ghiền Mì Gõ Để không bỏ lỡ những video hấp dẫn", at: t), "")
+// 13 Nov 2026: the final in place of an answer, and a mic line's live words
+eq(m.clean("Các bạn hãy đăng kí cho kênh lalaschool bề mồ bồ.", at: t), "")
+eq(m.clean("Mọi người hãy đăng ký kênh để ủng hộ kênh của mình nhé.", at: t), "")
+eq(m.clean("Để tập trung vào các phần tiếp theo, hãy nhấn vào phần bình luận để nhận thêm nhiều video mới nhé.", at: t), "Để tập trung vào các phần tiếp theo, hãy")
 eq(m.clean("Dạ. Dạ.", at: t), "Dạ. Dạ.")
 eq(m.clean("Bản 1.5 có sửa file config.json rồi nhé.", at: t), "Bản 1.5 có sửa file config.json rồi nhé.")
 eq(m.clean("Thank you mọi người.", at: t), "Thank you mọi người.")
@@ -368,7 +372,7 @@ RunLoop.main.run()
         out = self.recheck_run(screened=True, open_text="We need to ship the hotfix to production.", seconds=1.5)
         self.assertIn("pinned: vietnamese", out)                            # under 2 s of voice: too little to judge the lock
 
-    def quiet_stream_run(self, *, lead, peak):
+    def quiet_stream_run(self, *, lead, peak, live="", final="heard it"):
         """A stream: `lead` seconds of background ("hush" or "hiss"), then the `say` voice scaled to `peak`, then a pause."""
         root = self.scratch()
         aiff, caf = root / "a.aiff", root / "a.caf"
@@ -385,7 +389,7 @@ final class Calls: @unchecked Sendable {{ let lock = NSLock(); var n = 0 }}
 let calls = Calls()
 var finals: [String] = []
 let m = MeetingWhisper(heard: {{ t, final in if final && !t.isEmpty {{ finals.append(t) }} }}, failed: {{ print("failed", $0); exit(1) }},
-    pass: {{ _, _, _, careful in calls.lock.withLock {{ calls.n += 1 }}; return (careful ? "heard it" : "", nil) }}, screened: {{ false }})
+    pass: {{ _, _, _, careful in calls.lock.withLock {{ calls.n += 1 }}; return (careful ? {json.dumps(final, ensure_ascii=False)} : {json.dumps(live, ensure_ascii=False)}, nil) }}, screened: {{ false }})
 var at = 0
 Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) {{ t in
     guard at < all.count else {{ t.invalidate(); return }}
@@ -414,6 +418,30 @@ print("ok")
         self.assertIn("finals: heard it", out)
         self.assertIn("level: 0.0050", out)
         self.assertRegex(out, r"1 sent, 1 with words")
+
+    def test_final_that_drops_most_of_the_live_words_keeps_the_live_words(self):
+        # 13 Nov 2026: 79 live words of an answer came back from the final pass as "Các bạn hãy đăng kí cho kênh lalaschool"
+        said = "Về hai cái Scrum team này thì cái team mà em được assign chính vẫn là cái team làm về core của frontend."
+        out = self.quiet_stream_run(lead="hush", peak=0.3, live=said, final="Tạm biệt.")
+        self.assertIn("finals: " + said + "\n", out)
+        self.assertIn("1 kept live words", out)
+        out = self.quiet_stream_run(lead="hush", peak=0.3, live=said, final="Về hai cái Scrum team này thì cái team em được assign chính là team core frontend.")
+        self.assertIn("finals: Về hai cái Scrum team này thì cái team em được assign chính là team core frontend.\n", out)   # a fair final wins
+        self.assertIn("0 kept live words", out)
+        self.scratch()
+        run_swift(self, engine() + """
+precondition(!MeetingWhisper.keepsDraft(final: "", draft: "dạ đúng rồi anh"))                   // too few live words to trust
+precondition(!MeetingWhisper.keepsDraft(final: "", draft: "ok ok ok ok ok ok ok ok ok ok"))     // live words looping
+precondition(!MeetingWhisper.keepsDraft(final: "", draft: "Để tập trung vào các phần tiếp theo, hãy nhấn vào phần bình luận để nhận thêm nhiều video mới nhé."))   // a sign-off live
+precondition(MeetingWhisper.keepsDraft(final: "sẽ muốn deliver", draft: "có một cái buổi catch up để mà follow vào những cái tiến độ mà Dev họ đã làm"))
+print("ok")
+""", timeout=30)
+
+    def test_server_keeps_timestamps_so_long_clips_are_read_to_the_end(self):
+        # -nt made whisper.cpp skip what the decoder hadn't reached in each 30 s window: a sentence of a 38 s clip, with beam 5
+        source = (ROOT / "Atticus.swift").read_text()
+        launch = source[source.index('"$0" -m "$1"'):].split("\n")[0]
+        self.assertNotIn(" -nt ", launch)
 
     def test_hiss_in_a_noisy_room_still_never_reaches_whisper(self):
         out = self.quiet_stream_run(lead="hiss", peak=0)
@@ -469,6 +497,14 @@ precondition(a.take(600).count == 600 && a.snapshot().count == 1000)
 precondition(Whisper.withoutInvented("Hãy subscribe cho kênh La La School Để không bỏ lỡ những video hấp dẫn") == "" && Whisper.withoutInvented(" Hãy subscribe cho kênh Ghiền Mì Gõ") == "")
 precondition(Whisper.withoutInvented("Chúng ta cần deploy bản hotfix lên production trước thứ sáu.") == "Chúng ta cần deploy bản hotfix lên production trước thứ sáu.")
 precondition(Whisper.withoutInvented("Mình deploy thôi Cảm ơn các bạn đã theo dõi.") == "Mình deploy thôi")
+// 17 Nov 2026: only the tail of the sign-off came back, over and over
+precondition(Whisper.withoutInvented(" video hấp dẫn") == "" && Whisper.withoutInvented("những video hấp dẫn") == "")
+precondition(Whisper.withoutInvented("Ơ coi tuyết rơi này nọ rồi video hấp dẫn") == "Ơ coi tuyết rơi này nọ rồi")
+// segments come untrimmed: one that starts a word starts with a space, one that goes on with a word doesn't
+precondition(Whisper.said([" Atlanta không có tuyết đ", "úng không?"]) == "Atlanta không có tuyết đúng không?")
+precondition(Whisper.said([" họ dự báo là ti", "ết nó sẽ đổ dày á,", " thì họ rải m", "ấy cái đá."]) == "họ dự báo là tiết nó sẽ đổ dày á, thì họ rải mấy cái đá.")
+precondition(Whisper.said([" Mình deploy thôi", " Cảm ơn các bạn đã theo dõi.", " Dạ."]) == "Mình deploy thôi Dạ.")
+precondition(Whisper.said([" Anh S", "ơn có update gì không?"]) == "Anh Sơn có update gì không?" && Whisper.said([]) == "")
 print("ok")
 """, timeout=30)
 
