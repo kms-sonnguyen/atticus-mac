@@ -613,14 +613,14 @@ def client():
 # A chain runs outside only if every part is listed, so harmless read-only tools are too ("…; curl wttr.in", "| head").
 SAFE_OUT = [f'{c} *' for c in ('osascript', 'open', 'mdfind', 'curl', 'head', 'tail', 'grep', 'sort', 'wc', 'echo', 'sleep', 'date', ME)] + ['pbpaste', 'date'] + [f'orca terminal {c} *' for c in ('list', 'read', 'send')]
 # What the user must OK first. Matched per command, so `open "…?q=buy shoes"` or a search for "delete" never asks.
-RISKY = [('Delete something?', r'\b(rm|rmdir|srm|unlink|shred|trash|mv)\s|\bdelete\b|empty (the )?trash'),
+RISKY = [('Delete something?', r'\b(rm|rmdir|srm|unlink|shred|trash|mv)\s|\bdelete\b|empty\s+(the\s+)?trash'),
          ('Send this?', r'\bsend\b|\bsendmail\b|curl\b.*\s((?-i:-[a-zA-Z]*X)\s*[\'"]?(POST|PUT|PATCH|DELETE)|--request[\s=]*[\'"]?(POST|PUT|PATCH|DELETE)|--data|--form|--json|--upload-file|(?-i:-[a-zA-Z]*[dFT]))'),
-         ('Buy this?', r'\b(buy|purchase|checkout|check out|place (an |the )?order|pay)\b'),
+         ('Buy this?', r'\b(buy|purchase|checkout|check\s+out|place\s+(an\s+|the\s+)?order|pay)\b'),
          # every way curl, sort and AppleScript/JXA write a file: they run outside the sandbox
          ('Change a file?', r'(?<![0-9&])>>?\s*(?!/dev/null|&|/tmp/)\S|\btee\s|curl\b.*\s((?-i:-[a-zA-Z]*[oODcK])|--(output|remote-name|dump-header|cookie-jar|trace|stderr|libcurl|etag-save|hsts|alt-svc|config)\b)|%output\{'
-                            r'|\bsort\b.*\s((?-i:-[a-zA-Z]*o)|--output)|\bwrite\b.*\bto\b|write permission|writeTo(File|URL)'),
+                            r'|\bsort\b.*\s((?-i:-[a-zA-Z]*o)|--output)|\bwrite\b.*\bto\b|write\s+permission|writeTo(File|URL)'),
          # AppleScript and JXA can run shell text: Terminal's do script, do shell script, run/load script, ObjC tasks
-         ('Run a system command?', r'\bdo ?(shell ?)?script\b|\b(run|load) ?script\b|\bNSTask\b|\$\.(system|popen)\b|\bsudo\b|\bkillall\b|\bdefaults write\b')]
+         ('Run a system command?', r'\bdo\s*(shell\s*)?script\b|\b(run|load)\s*script\b|\bNSTask\b|\$\.(system|popen)\b|\bsudo\b|\bkillall\b|\bdefaults\s+write\b')]
 # Atticus.swift's riskyPattern: a raw System Events click asks for the same controls --hands does
 RISKY_LABEL = r"(?i)\b(buy|purchase|pay|payment|checkout|order|send|delete|remove|trash|submit|publish|post|sign.?out|log.?out|unsubscribe|subscribe|transfer|bid|erase|withdraw|donate|authorize|grant access|allow access|logout|book|reserve|merge|deploy|discard|wipe|format|apply(?! filters| changes| settings| coupon| code| promo| discount| theme| style| formatting)|confirm)\b"
 RUNS = ('.command', '.tool', '.terminal', '.sh', '.zsh', '.bash', '.app', '.workflow', '.action')   # macOS runs these when opened
@@ -1549,7 +1549,9 @@ def spotify_item(name, anything=True, exact=False):
         except (OSError, ValueError) as e:
             errors.append(f'HTTP {e.code}' if isinstance(e, urllib.error.HTTPError) else 'the search request failed (network or timeout)')
     if errors:
-        raise RuntimeError('Could not search Spotify: ' + '; '.join(dict.fromkeys(errors)) + '.')
+        search = 'https://open.spotify.com/search/' + urllib.parse.quote(name, safe='')
+        raise RuntimeError('Could not search Spotify via web search: ' + '; '.join(dict.fromkeys(errors)) +
+                           '. Playback has not started. Search directly in Spotify: ' + search)
     return None
 
 
@@ -4006,6 +4008,8 @@ def claude_plan():
         return {'ok': False, 'need': 'install', 'text': 'Could not start Claude Code. Reinstall it and try again.'}
     except (ValueError, subprocess.TimeoutExpired):
         return {'ok': False, 'need': 'login', 'text': 'Could not read your Claude sign-in.'}
+    if Path(DIR, 'claude-signed-out').exists():   # auth status can stay logged in after a real request rejects the session
+        return {'ok': False, 'need': 'login', 'text': 'Your Claude sign-in expired. Click Sign In to reconnect.'}
     if not s.get('loggedIn'):
         return {'ok': False, 'need': 'login', 'text': 'Sign in to Claude to start.'}
     if s.get('authMethod') != 'claude.ai':
@@ -5933,7 +5937,10 @@ def run(task, p=None, shots=(), auto_work=False, *, request=None, main_only=Fals
             if callable(getattr(getattr(p, 'errors', None), 'close', None)): p.errors.close()
             return run(task, start_claude(getattr(p, 'atticus_model', None)), (), auto_work,
                        request=request, main_only=main_only, routing_retry=routing_retry)
-        run.why = failure_why(detail, custom)
+        # The CLI's terminal error takes precedence over unrelated stderr diagnostics.
+        run.why = failure_why(result.strip() if result_error and result.strip() else detail, custom)
+        if run.why == 'signed_out' and not custom:
+            Path(DIR, 'claude-signed-out').touch(mode=0o600)
         if custom and run.why == 'stopped':
             selected, available = str(pref('apiModel', '')).strip(), models()
             if selected and available and selected not in available: run.why = 'model_missing'
@@ -5945,7 +5952,7 @@ def run(task, p=None, shots=(), auto_work=False, *, request=None, main_only=Fals
                 reply = 'Your custom server rejected its credentials. Check its key in Settings.'
             else:
                 say('!', 'setup')
-                reply = 'Your Claude sign-in expired. Open Terminal and run claude auth login to sign in again.'
+                reply = 'Your Claude sign-in expired. Open Atticus Settings, choose Set Up, then click Sign In.'
         elif run.why == 'too_long':
             reply = f'This request is too long for {"your custom server" if custom else "Claude"}. Close this box with ✕ to start fresh, then ask again with less text.'
         elif run.why == 'plan_limit':
@@ -5982,6 +5989,8 @@ def run(task, p=None, shots=(), auto_work=False, *, request=None, main_only=Fals
     run.ok = base_ok and verified
     if not run.why and getattr(p, 'ask', '') and os.path.exists(os.path.join(p.ask, 'declined')):
         run.ok, run.why, run.cmds = False, 'cancelled', []
+    if run.ok and not server():
+        Path(DIR, 'claude-signed-out').unlink(missing_ok=True)
     if not run.ok and not run.why:
         run.why = next(w for w, hit in (('timed_out', timed_out[0]), ('not_finished', not completed), ('tool_failed', last_failed),
                                         ('unverified', base_ok), ('no_reply', not reply), ('other', True)) if hit)
@@ -8334,7 +8343,7 @@ if __name__ == '__main__':
         assert not risky(f'{SEARCH} "how to delete a file"') and not risky('open "https://google.com/search?q=buy shoes"') and not risky(f'{SHOW} "Notes"; {PLACE} "Notes" left current')
         assert risky('rm -rf ~/x') == risky('open -a Notes; mv ~/a ~/.Trash/') == 'Delete something?' and risky('open "$(rm x)"')
         assert risky('osascript -e \'tell application "Mail" to send m\'') == 'Send this?' == risky('curl -s -X POST https://x') and not risky("curl -s 'wttr.in/x?format=%l'")
-        assert risky('osascript -e \'do shell script "echo"\'') == 'Run a system command?' and risky("osascript -e 'tell application \"Notes\" to delete note 1'") == 'Delete something?'
+        assert all(risky(f"osascript -e '{c}'") == 'Run a system command?' for c in ('do shell script "echo"', 'do  shell script "echo"', 'do\tshell\tscript "echo"', 'do\nshell\nscript "echo"', 'do shell  script "echo"', 'do  script "echo"', 'run  script "echo"', 'load  script "echo"', 'defaults  write test key value')) and risky("osascript -e 'tell application \"Notes\" to delete note 1'") == 'Delete something?'
         assert risky('echo x >> ~/.zshrc') == 'Change a file?' == risky('curl -s -o ~/x https://y') and not risky('osascript -e x 2>&1; ls >/dev/null; echo > /tmp/a')
         assert risky('open -a Notes & osascript -e \'tell application "Mail" to send m\'') == 'Send this?'
         sys.exit(print('selftest ok'))

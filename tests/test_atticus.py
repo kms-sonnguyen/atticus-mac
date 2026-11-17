@@ -1597,6 +1597,26 @@ print(json.dumps({{'type':'message_end','message':{{'role':'assistant','content'
                 self.assertEqual(atticus.run.cmds, [])
                 self.assertEqual(atticus.run.ran, ['pgrep fixture'])
 
+    def test_claude_error_classification_uses_terminal_result_before_stderr(self):
+        cases = [
+            ('Service unavailable', 'MCP diagnostic: OAuth sign in returned HTTP 401', 'unavailable'),
+            ('HTTP 429 rate limit exceeded', 'Tool diagnostic: not logged in', 'rate_limited'),
+            ('Failed to authenticate: OAuth session expired', 'network timeout', 'signed_out'),
+            ('', 'Failed to authenticate: OAuth session expired', 'signed_out'),
+            (None, 'Failed to authenticate: OAuth session expired', 'signed_out'),
+        ]
+        for result, diagnostic, why in cases:
+            with self.subTest(result=result, diagnostic=diagnostic):
+                p = unittest.mock.Mock(ask='', returncode=1, stdin=io.StringIO(), errors=io.StringIO(diagnostic))
+                p.stdout = [] if result is None else [json.dumps({'type': 'result', 'is_error': True, 'result': result})]
+                with patch.object(atticus, 'say') as say, patch.object(atticus, 'plan', return_value={'ok': True}):
+                    reply, _, _ = atticus.run('Fixture request', p)
+                self.assertEqual(atticus.run.why, why)
+                self.assertFalse(atticus.run.ok)
+                self.assertIn(diagnostic, atticus.run.error)
+                self.assertEqual('Your Claude sign-in expired.' in reply, why == 'signed_out')
+                self.assertEqual(unittest.mock.call('!', 'setup') in say.call_args_list, why == 'signed_out')
+
     def test_expired_signin_opens_setup_despite_logged_in_status(self):
         error = 'Failed to authenticate: OAuth session expired and could not be refreshed'
         for is_error, tools, text in ((True, False, error), (True, True, error), (False, False, error), (True, False, 'Service unavailable')):
@@ -1609,7 +1629,7 @@ print(json.dumps({{'type':'message_end','message':{{'role':'assistant','content'
                     reply, _, _ = atticus.run('test', p)
                 if is_error and text == error:
                     self.assertEqual(say.call_args_list.count(unittest.mock.call('!', 'setup')), 1)
-                    self.assertEqual(reply, 'Your Claude sign-in expired. Open Terminal and run claude auth login to sign in again.')
+                    self.assertEqual(reply, 'Your Claude sign-in expired. Open Atticus Settings, choose Set Up, then click Sign In.')
                     self.assertFalse(atticus.run.ok)
                 elif is_error:
                     self.assertIn('temporarily unavailable', reply)
@@ -1618,6 +1638,38 @@ print(json.dumps({{'type':'message_end','message':{{'role':'assistant','content'
                     self.assertEqual(reply, text)
                     self.assertNotIn(unittest.mock.call('!', 'setup'), say.call_args_list)
                 plan.assert_not_called()
+
+    def test_real_signed_out_overrides_stale_status_until_success(self):
+        status = json.dumps({'loggedIn': True, 'authMethod': 'claude.ai', 'subscriptionType': 'pro'})
+        marker = self.root / 'claude-signed-out'
+        def ask(text, failed):
+            p = unittest.mock.Mock(ask='', returncode=0, stdin=io.StringIO(), errors=io.StringIO())
+            p.stdout = [json.dumps({'type': 'result', 'is_error': failed, 'result': text})]
+            return atticus.run('Fixture request', p)
+        with patch.object(atticus, 'say'), patch.object(atticus.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, status)):
+            self.assertTrue(atticus.plan()['ok'])
+            ask('Service unavailable', True)
+            self.assertFalse(marker.exists())
+            with patch.object(atticus, 'server', return_value={'ANTHROPIC_BASE_URL': 'https://fixture.invalid'}):
+                ask('Unauthorized HTTP 401', True)
+                self.assertFalse(marker.exists())
+            ask('Failed to authenticate: OAuth session expired', True)
+            self.assertTrue(marker.exists())
+            self.assertEqual(marker.stat().st_mode & 0o777, 0o600)
+            for _ in range(2):
+                self.assertEqual((atticus.plan()['ok'], atticus.plan()['need']), (False, 'login'))
+            with patch.object(atticus, 'server', return_value={'ANTHROPIC_BASE_URL': 'https://fixture.invalid'}), patch.object(atticus.shutil, 'which', return_value='/fixture/claude'):
+                self.assertTrue(atticus.plan()['ok'])
+                ask('Unauthorized HTTP 401', True)
+                self.assertTrue(marker.exists())
+                ask('Fixture answer', False)
+                self.assertTrue(marker.exists())
+            ask('Service unavailable', True)
+            self.assertTrue(marker.exists())
+            ask('Fixture answer', False)
+            self.assertTrue(atticus.run.ok)
+            self.assertFalse(marker.exists())
+            self.assertTrue(atticus.plan()['ok'])
 
     def test_claude_process_errors_are_actionable_and_keep_clean_details(self):
         cases = [
