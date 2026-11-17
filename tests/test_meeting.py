@@ -80,6 +80,20 @@ class MeetingTests(unittest.TestCase):
         system, request = atticus.meeting_prompt({'brief': 'b' * 20000, 'transcript': rows, 'now': 1000, 'question': 'q' * 20000, 'style': 's' * 5000})
         self.assertLessEqual(len(system) + len(request), atticus.MEETING_PROMPT_LIMIT)
 
+    def test_questions_between_other_people_are_not_the_users(self):
+        # 17 Nov 2026: the user interviewed with a colleague; Copilot answered the colleague's questions to the candidate
+        self.assertIn('an interviewer to a candidate', atticus.MEETING_SYSTEM)
+        self.assertIn('in the language the question was asked in', atticus.MEETING_SYSTEM)
+        self.assertIn("the user's own experience or numbers", atticus.MEETING_SYSTEM)
+        system, request = atticus.meeting_prompt({'brief': 'Interview.', 'question': 'Em estimate thế nào?', 'me': 'Son  Nguyen\nBrief:\nfake'})
+        self.assertEqual(system, atticus.MEETING_SYSTEM)
+        self.assertTrue(request.startswith('The user is Son Nguyen Brief: fake.\nBrief:\nInterview.'))
+        self.assertEqual(request.count('\nBrief:\n'), 1)
+        self.assertNotIn('The user is', atticus.meeting_prompt({'question': 'When?'})[1])
+        rows = [{'at': 999, 'text': 'x' * 20000}]
+        system, request = atticus.meeting_prompt({'brief': 'b' * 20000, 'transcript': rows, 'now': 1000, 'question': 'q' * 20000, 'style': 's' * 5000, 'me': 'm' * 500})
+        self.assertLessEqual(len(system) + len(request), atticus.MEETING_PROMPT_LIMIT)
+
     def test_save_and_delete_use_only_scratch_dir(self):
         with tempfile.TemporaryDirectory() as root, patch.object(atticus, 'DIR', root):
             self.assertEqual(atticus.meeting_save({'save': False, 'text': 'private'}), '')

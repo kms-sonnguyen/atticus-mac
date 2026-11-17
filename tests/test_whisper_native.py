@@ -227,7 +227,15 @@ eq(m.clean("Hãy subscribe cho kênh Ghiền Mì Gõ Để không bỏ lỡ nh�
 // 13 Nov 2026: the final in place of an answer, and a mic line's live words
 eq(m.clean("Các bạn hãy đăng kí cho kênh lalaschool bề mồ bồ.", at: t), "")
 eq(m.clean("Mọi người hãy đăng ký kênh để ủng hộ kênh của mình nhé.", at: t), "")
-eq(m.clean("Để tập trung vào các phần tiếp theo, hãy nhấn vào phần bình luận để nhận thêm nhiều video mới nhé.", at: t), "Để tập trung vào các phần tiếp theo, hãy")
+eq(m.clean("Để tập trung vào các phần tiếp theo, hãy nhấn vào phần bình luận để nhận thêm nhiều video mới nhé.", at: t), "Để tập trung vào các phần tiếp theo")
+// 17 Nov 2026 interview: the sign-off's lead-in left behind, a show's welcome, and noise in inverted marks
+eq(m.clean("Hãy đăng ký kênh để không bỏ lỡ.", at: t), "")
+eq(m.clean("Nếu bạn muốn tham gia thêm thông tin về các loại hình ảnh của mình, hãy", at: t), "")
+eq(m.clean("Chào mừng các bạn đã đến với chương trình của chúng tôi.", at: t), "")
+eq(m.clean("Ok, ¡¡¡¡¡¡¡¡¡¡¡¡¡¡¡!!", at: t), "Ok,")
+eq(m.clean("¡¡¡!!", at: t), "")
+eq(m.clean("Hãy nghĩ thêm về cái regression plan nhé.", at: t), "Hãy nghĩ thêm về cái regression plan nhé.")
+eq(m.clean("Chào mừng các bạn đến với buổi review sprint hôm nay.", at: t), "Chào mừng các bạn đến với buổi review sprint hôm nay.")
 eq(m.clean("Dạ. Dạ.", at: t), "Dạ. Dạ.")
 eq(m.clean("Bản 1.5 có sửa file config.json rồi nhé.", at: t), "Bản 1.5 có sửa file config.json rồi nhé.")
 eq(m.clean("Thank you mọi người.", at: t), "Thank you mọi người.")
@@ -308,6 +316,23 @@ fresh.release(callThrough: .distantFuture, now: t0); precondition(late == ["Mìn
 print("ok")
 """, timeout=30)
 
+    def test_a_line_written_in_vietnamese_moves_a_lock_on_another_language(self):
+        self.scratch()
+        run_swift(self, engine() + """
+// 17 Nov 2026 interview: the mic locked to English translated Vietnamese, but wrote these out as said
+precondition(Whisper.vietnamese("bây giờ là em là người owner của cái framework của cái automation đó"))
+precondition(Whisper.vietnamese("Tất là em đã thử rồi hả?") && Whisper.vietnamese("bộ test case của em đang nhận tên là có bao nhiêu test"))
+precondition(!Whisper.vietnamese("I think I know how to automate the automation part."))
+precondition(!Whisper.vietnamese("Ask Nguyễn Văn Sơn to review the pull request for the checkout flow before Friday."))   // a name is not a language
+precondition(!Whisper.vietnamese("Dạ"))
+print("ok")
+""", timeout=30)
+        out = self.recheck_run(screened=False, open_text="", locked="english", locked_text="bây giờ là em là người owner của cái framework của cái automation đó")
+        self.assertIn("pinned: vietnamese", out)                            # one written line is proof: no second line needed
+        self.assertIn("finals: bây giờ là em là người owner", out)
+        out = self.recheck_run(screened=False, open_text="", locked="english", locked_text="I want to test with the new iPhone size, which I can set in the config.")
+        self.assertIn("pinned: english", out)                               # a translation looks like English: nothing to go on
+
     def test_garbled_answers_and_releasing_the_lock(self):
         self.scratch()
         run_swift(self, engine() + """
@@ -323,7 +348,7 @@ l.note("english", seconds: 5); precondition(l.pinned == "english")
 print("ok")
 """, timeout=30)
 
-    def recheck_run(self, *, screened, open_text, seconds=4.0):
+    def recheck_run(self, *, screened, open_text, seconds=4.0, locked="vietnamese", locked_text=""):
         """One line through MeetingWhisper with a fake pass: the locked pass hears nothing, the open one hears open_text."""
         root = self.scratch()
         aiff, caf = root / "a.aiff", root / "a.caf"
@@ -336,13 +361,13 @@ let voice = try! Data(contentsOf: URL(fileURLWithPath: "{root}/v.f32")).withUnsa
 let clip = Array(voice.prefix(Int({seconds} * 16000))) + [Float](repeating: 0, count: 16000)
 final class Calls: @unchecked Sendable {{ let lock = NSLock(); var all: [String] = [] }}
 let calls = Calls(), lang = MeetingLanguage()
-lang.note("vietnamese", seconds: 5); lang.note("vietnamese", seconds: 5)
+lang.note("{locked}", seconds: 5); lang.note("{locked}", seconds: 5)
 Prefs.set("whisperLanguage", "auto")
 var finals: [String] = []
 let m = MeetingWhisper(language: lang, heard: {{ t, final in if final {{ finals.append(t) }} }}, failed: {{ print("failed", $0); exit(1) }},
     pass: {{ _, _, language, careful in
         calls.lock.withLock {{ calls.all.append("\\(language ?? "nil")/\\(careful ? "beam" : "greedy")") }}
-        return language == "auto" ? ({json.dumps(open_text, ensure_ascii=False)}, "english") : ("", nil)
+        return language == "auto" ? ({json.dumps(open_text, ensure_ascii=False)}, "english") : ({json.dumps(locked_text, ensure_ascii=False)}, language)
     }}, screened: {{ {"true" if screened else "false"} }})
 let b = AVAudioPCMBuffer(pcmFormat: AVAudioFormat(standardFormatWithSampleRate: 16000, channels: 1)!, frameCapacity: AVAudioFrameCount(clip.count))!
 b.frameLength = AVAudioFrameCount(clip.count); clip.withUnsafeBufferPointer {{ b.floatChannelData![0].update(from: $0.baseAddress!, count: clip.count) }}

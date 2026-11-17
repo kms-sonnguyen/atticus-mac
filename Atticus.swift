@@ -639,9 +639,22 @@ final class Whisper: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
     static func withoutInvented(_ text: String) -> String {
         let phrases = ["hãy subscribe", "subscribe cho kênh", "để không bỏ lỡ những video", "không bỏ lỡ những video", "những video hấp dẫn", "video hấp dẫn", "cảm ơn các bạn đã theo dõi", "hẹn gặp lại các bạn trong",
                        "các bạn hãy đăng k", "mọi người hãy đăng k", "đăng kí cho kênh", "đăng ký cho kênh", "đăng kí kênh", "đăng ký kênh", "nhấn vào phần bình luận",
+                       "chào mừng các bạn đã đến với chương trình", "chào mừng các bạn đến với chương trình", "chào mừng các bạn đã đến với kênh",
+                       "chào mừng các bạn đến với kênh", "đến với chương trình của chúng tôi", "nếu bạn muốn tham gia thêm thông tin",
                        "thank you for watching", "thanks for watching", "please subscribe", "subscribe to my channel", "that's it for this video", "if you enjoyed this video", "undertekster", "amara.org"]
         let hit = phrases.compactMap { text.range(of: $0, options: [.caseInsensitive, .diacriticInsensitive]) }.map(\.lowerBound).min()
-        return hit.map { String(text[..<$0]).trimmingCharacters(in: .whitespaces) } ?? text
+        // the sign-off's lead-in stays behind the cut ("…của mình, hãy" before "đăng ký kênh"): it goes with it
+        return hit.map { String(text[..<$0]).replacingOccurrences(of: #"[,\s]*((các bạn|mọi người)\s+)?hãy[,\s]*$"#, with: "", options: [.regularExpression, .caseInsensitive])
+            .trimmingCharacters(in: .whitespaces) } ?? text
+    }
+    // Letters only Vietnamese spells (ă đ ơ ư, a tone mark under or over a vowel). A stream locked to English on Vietnamese mixed
+    // with English terms translates it, fluent and never garbled, but now and then writes a line out in Vietnamese: proof the lock
+    // is wrong. Three such words, a quarter of the line: a Vietnamese name in an English sentence is not enough.
+    static func vietnamese(_ text: String) -> Bool {
+        let marks = Set("ăđơưạảấầẩẫậắằẳẵặẹẻẽếềểễệỉịọỏốồổỗộớờởỡợụủứừửữựỳỵỷỹ")
+        let words = text.lowercased().split(whereSeparator: { !$0.isLetter })
+        let marked = words.filter { $0.contains(where: marks.contains) }.count
+        return marked >= 3 && marked * 4 >= words.count
     }
     static func wav(_ pcm: [Float]) -> Data {   // 16 kHz mono 16-bit PCM
         var d = Data(capacity: 44 + pcm.count * 2)
@@ -693,6 +706,7 @@ final class MeetingLanguage: @unchecked Sendable {   // main thread only
         if seen == language { pinned = language } else { seen = language }
     }
     func release() { pinned = nil; seen = nil }   // a new lock needs two lines again: one odd clip never moves it
+    func written(_ language: String) { pinned = language; seen = language }   // a line written out in a language is proof, not a guess
     var request: String? { ["", "auto"].contains(Prefs.str("whisperLanguage")) ? pinned : nil }
 }
 private final class SpeechScore: NSObject, SNResultsObserving {
@@ -745,9 +759,11 @@ final class MeetingWhisper: @unchecked Sendable {   // touched on the main threa
         recent.removeAll { now.timeIntervalSince($0.at) > 60 }
         var kept: [String] = []
         for match in text.matches(of: try! Regex(#".+?(?:[.!?…]+(?=\s|$)|$)"#)) {   // a dot inside "1.5" or "config.json" doesn't end a sentence
-            let sentence = Self.unrepeated(Whisper.withoutInvented(text[match.range].trimmingCharacters(in: .whitespaces)))
+            // "Ok, ¡¡¡¡¡¡!!": a run of inverted marks is Whisper's noise, never Vietnamese or English
+            let sentence = Self.unrepeated(Whisper.withoutInvented(text[match.range].replacingOccurrences(of: #"\s*[!?]*[¡¿][¡¿!?]*"#, with: "", options: .regularExpression)
+                .trimmingCharacters(in: .whitespaces)))
             let words = sentence.lowercased().split(whereSeparator: { !$0.isLetter && !$0.isNumber }), key = words.joined(separator: " ")
-            if sentence.isEmpty { continue }
+            if words.isEmpty { continue }   // punctuation alone
             if words.count >= 4 {
                 if let i = recent.firstIndex(where: { $0.text.contains(key) }) { if remember { recent[i].at = now }; continue }
                 if remember { recent.append((key, now)) }
@@ -863,7 +879,10 @@ final class MeetingWhisper: @unchecked Sendable {   // touched on the main threa
                     if got.noise { self.counts.noise += 1 } else { self.counts.sent += 1 }
                     if !text.isEmpty { self.counts.lines += 1 }
                     if got.released { self.language.release() }
-                    if !text.isEmpty, !Whisper.garbled(got.text) { self.language.note(got.language, seconds: Double(pcm.count) / 16000) }
+                    // the pass reports the language it was told; a line written in Vietnamese is Vietnamese, and moves a lock on another
+                    let spoken = Whisper.vietnamese(text) ? "vietnamese" : got.language
+                    if spoken == "vietnamese", let pinned = self.language.pinned, pinned != "vietnamese" { self.language.written("vietnamese") }
+                    else if !text.isEmpty, !Whisper.garbled(got.text) { self.language.note(spoken, seconds: Double(pcm.count) / 16000) }
                     self.heard(text, true)
                 case .failure(let e): self.fails += 1; if self.fails >= 3 { self.failed(e.localizedDescription) }
                 }
@@ -6927,7 +6946,7 @@ final class MeetingCopilot: NSObject, WKScriptMessageHandler {
         }
         guard !queue.isEmpty else { return }
         var data = queue.removeFirst(); let id = data["id"] as! Int
-        data["brief"] = brief; data["style"] = style
+        data["brief"] = brief; data["style"] = style; data["me"] = name   // the Copilot answers only what is put to you
         answering = id; measured[id] = data["at"] as? Double
         answerTimes[id] = ["final": data["finalAt"] as? Double ?? Date().timeIntervalSince1970,
                            "detected": data["detectedAt"] as? Double ?? Date().timeIntervalSince1970,
