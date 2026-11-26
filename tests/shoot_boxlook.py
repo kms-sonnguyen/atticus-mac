@@ -62,7 +62,7 @@ if mode=="measure"{   // the glass alone (no page) over flat backdrops: the mate
 }else{
  glass()
  let html=try! String(contentsOfFile:dir+"/ui/ui.html",encoding:.utf8),orbs=try! String(contentsOfFile:dir+"/ui/orbs.js",encoding:.utf8)
- web.loadHTMLString(html.replacingOccurrences(of:"/*ORBS*/",with:orbs),baseURL:nil)
+ web.loadHTMLString(html.replacingOccurrences(of:"/*TOKENS*/",with:(try? String(contentsOfFile:dir+"/ui/tokens.css",encoding:.utf8)) ?? "").replacingOccurrences(of:"/*ORBS*/",with:orbs),baseURL:nil)
  let backs=["light":#"LIGHT"#,"dark":#"DARK"#]
  let scenes:[(String,String,String,String)]=SCENES
  func play(_ i:Int){guard i<scenes.count else{print("box shots ok");exit(0)};let (name,look,ask,check)=scenes[i]
@@ -97,6 +97,10 @@ SCENES = [('sections-dark', 'dark', ask('can you tell me the pythagorean theorem
           ('sections-light', 'light', ask('can you tell me the pythagorean theorem and explain', SECTIONS, ['Searching the web: pythagorean theorem', 'Drawing on your screen']), CHECK_SECTIONS),('math-light', 'light', ask('and 36', MATH), CHECK_MATH), ('math-dark', 'dark', ask('and 36', MATH), CHECK_MATH),
           ('list-light', 'light', ask('Where should we eat tonight?', LIST), CHECK_LIST), ('list-dark', 'dark', ask('Where should we eat tonight?', LIST), CHECK_LIST),
           ('math-more-dark', 'dark', ask('Show me some formulas', MORE), CHECK_MORE)]
+PICK = "ui.listen(false);ui.models({list:['cheapest','balanced','capable'],pick:'balanced'});ui.hover(true);document.getElementById('model').click();"
+CHECK_PICK = "(()=>{const e=document.getElementById('modewhy');return !e.hidden&&e.textContent.length>40?'ok why '+e.textContent:'bad '+e.outerHTML})()"
+SCENES += [('picker-light', 'light', PICK, CHECK_PICK), ('picker-dark', 'dark', PICK, CHECK_PICK),
+           ('picker-cheapest-dark', 'dark', PICK + "document.querySelector('#models [data-v=cheapest]').focus();", CHECK_PICK)]
 
 
 def fixture():

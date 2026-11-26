@@ -14,7 +14,96 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import atticus
 
 
+def brave_result(title, kind, identifier):
+    """Brave's page for a non-browser client: the link is a redirect, the Spotify page only in the result's data."""
+    return (f'{{title:"{title}",url:"/go/v1/fixture",description:"Listen on Spotify.",profile:{{name:"Spotify",long_name:"open.spotify.com"}},'
+            f'type:"search_result",meta_url:{{scheme:"https",netloc:"open.spotify.com",hostname:"open.spotify.com",favicon:a,'
+            f'path:"› {kind}  › {identifier}"}},thumbnail:void 0}}')
+
+
+def spotify(*readings, old='spotify:track:' + 'O' * 22):
+    """A fake osascript for play(): the play command answers the track loaded before, each later reading is the next state Spotify reports (the last repeats)."""
+    readings = list(readings)
+    def run(args, **_):
+        out = old if args[-1].startswith('spotify:') else readings.pop(0) if len(readings) > 1 else readings[0]
+        return subprocess.CompletedProcess(args, 0, out + '\n', '')
+    return run
+
+
 class SpotifyTests(unittest.TestCase):
+    def setUp(self):
+        played = tempfile.NamedTemporaryFile(suffix='.json', delete=False); played.close(); os.unlink(played.name)
+        self.addCleanup(lambda: os.path.exists(played.name) and os.unlink(played.name))
+        patcher = patch.object(atticus, 'PLAYED', played.name); patcher.start(); self.addCleanup(patcher.stop)
+        patcher = patch.object(atticus.time, 'sleep'); patcher.start(); self.addCleanup(patcher.stop)
+        patcher = patch.object(atticus, 'catalog_item', return_value=None); patcher.start(); self.addCleanup(patcher.stop)   # web-search tests; CatalogTests covers it
+
+    def fast_play(self, request, responses, script='playing\tfalse\tspotify:track:' + 'T' * 22 + '\tFixture Anthem\tThe Brightn'):
+        """fast() on a play ask with faked search pages and AppleScript: (reply, get mock, run mock, keep_behind mock)."""
+        with patch.object(atticus, 'pref', side_effect=lambda _, default: default), \
+             patch.object(atticus, 'skills', return_value={}), patch.object(atticus, 'fast_hands', return_value=None), \
+             patch.object(atticus, 'playlist', return_value=None), patch.object(atticus, 'get', side_effect=responses) as get, \
+             patch.object(atticus, 'osa', return_value='Editor'), patch.object(atticus, 'wants_focus', return_value=False), \
+             patch.object(atticus.subprocess, 'run', side_effect=spotify(script)) as run, \
+             patch.object(atticus, 'preview_app'), patch.object(atticus, 'keep_behind') as behind:
+            return atticus.fast(request), get, run, behind
+
+    def test_play_title_by_artist_is_instant_after_a_rate_limited_engine_and_misheard_artist(self):
+        limited = urllib.error.HTTPError('https://html.duckduckgo.com/html/', 429, 'limited', {}, None)
+        self.addCleanup(limited.close)
+        page = brave_result('Fixture Anthem - song and lyrics by The Brightn | Spotify', 'track', 'T' * 22)
+        reply, get, run, behind = self.fast_play('Play fixture anthem by the brighten.', [limited, page])
+        self.assertTrue(reply.startswith('Playing Fixture Anthem'), reply)
+        self.assertEqual(atticus.fast.cmds, [f'{atticus.PLAY} {atticus.shlex.quote("fixture anthem by the brighten")}'])
+        self.assertEqual(get.call_count, 2)
+        self.assertEqual(run.call_args_list[0].args[0][-1], 'spotify:track:' + 'T' * 22)
+        behind.assert_called_once_with('Editor', 'Spotify')
+
+        down = urllib.error.HTTPError('https://search.brave.com/search', 429, 'limited', {}, None)
+        self.addCleanup(down.close)
+        for again in ('play fixture anthem by the brightn on spotify', 'play fixture anthem', 'play the fixture anthem by the brighten'):
+            with self.subTest(again=again):
+                reply, get, run, _ = self.fast_play(again, [down, down])
+                self.assertEqual(reply, 'Playing Fixture Anthem by The Brightn on Spotify.')
+                get.assert_not_called()
+                self.assertEqual(run.call_args_list[0].args[0][-1], 'spotify:track:' + 'T' * 22)
+
+    def test_a_remembered_play_needs_its_whole_name_and_one_match(self):
+        Path(atticus.PLAYED).write_text(json.dumps({'spotify:track:' + 'U' * 22: ['Fixture Anthem', 'The Brightn'],
+                                                    'spotify:track:' + 'V' * 22: ['Other Song', 'First Band'],
+                                                    'spotify:track:' + 'W' * 22: ['Other Song', 'Second Band']}))
+        self.assertIsNone(atticus.remembered('anthem'))
+        self.assertIsNone(atticus.remembered('fixture anthem remix'))
+        self.assertIsNone(atticus.remembered('other song'))
+        self.assertEqual(atticus.remembered('other song by second band'), ('spotify:track:' + 'W' * 22, 'Other Song by Second Band'))
+
+    def test_bare_title_without_spotify_stays_with_the_ai(self):
+        page = brave_result('Fixture Game - song and lyrics by Some Band | Spotify', 'track', 'G' * 22)
+        reply, _, run, _ = self.fast_play('play fixture game', ['<html>challenge</html>', page])
+        self.assertIsNone(reply)
+        run.assert_not_called()
+
+    def test_failed_play_reports_what_failed_and_is_not_remembered(self):
+        page = brave_result('Fixture Anthem - song and lyrics by The Brightn | Spotify', 'track', 'T' * 22)
+        reply, _, _, behind = self.fast_play('play fixture anthem by the brightn on spotify', ['<html>challenge</html>', page], script='paused')
+        self.assertEqual(reply, 'Could not start Fixture Anthem - song and lyrics by The Brightn | Spotify in Spotify: '
+                                'playback did not reach the playing state.')
+        behind.assert_not_called()
+        self.assertFalse(os.path.exists(atticus.PLAYED))
+
+    def test_play_waits_past_another_track_and_remembers_only_the_requested_one(self):
+        item, other = ('spotify:track:' + 'R' * 22, 'Requested Song - song and lyrics by Fixture Band | Spotify'), 'spotify:track:' + 'Q' * 22
+        before, between = f'paused\tfalse\t{other}\tQueued Song\tOther Band', f'playing\ttrue\t{other}\tQueued Song\tOther Band'
+        for readings, reply in (((before, between, f'playing\ttrue\t{item[0]}\tRequested Song\tFixture Band'), f'Playing {item[1]}.'),
+                                ((between,), f'Could not start {item[1]} in Spotify: it kept playing another track.')):
+            with self.subTest(readings=readings), patch.object(atticus, 'spotify_item', return_value=item), \
+                 patch.object(atticus, 'osa', return_value='Editor'), patch.object(atticus, 'wants_focus', return_value=False), \
+                 patch.object(atticus.subprocess, 'run', side_effect=spotify(*readings, old='spotify:track:' + 'O' * 22)), \
+                 patch.object(atticus, 'preview_app'), patch.object(atticus, 'keep_behind'):
+                self.assertEqual(atticus.play('requested song'), reply)
+            saved = json.loads(Path(atticus.PLAYED).read_text()) if os.path.exists(atticus.PLAYED) else {}
+            self.assertEqual(saved, {item[0]: ['Requested Song', 'Fixture Band']})
+
     def test_lookup_prefers_cached_playlist_and_falls_back_to_web(self):
         cached = ('spotify:playlist:cached', 'Road trip')
         with patch.object(atticus, 'playlist', return_value=cached), patch.object(atticus, 'get') as get:
@@ -188,19 +277,19 @@ class SpotifyTests(unittest.TestCase):
         item = ('spotify:track:' + 'B' * 22, 'Fixture song')
         with patch.object(atticus, 'spotify_item', return_value=item) as lookup, \
              patch.object(atticus, 'osa', return_value='Editor'), \
-             patch.object(atticus.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, 'playing', '')) as run, \
+             patch.object(atticus.subprocess, 'run', side_effect=spotify(f'playing\tfalse\t{item[0]}\tFixture song\tFixture Band')) as run, \
              patch.object(atticus, 'preview_app') as preview, patch.object(atticus, 'wants_focus', return_value=False), \
              patch.object(atticus, 'keep_behind') as behind:
             self.assertEqual(atticus.play('fixture'), 'Playing Fixture song on Spotify.')
-        lookup.assert_called_once_with('fixture', True)
-        self.assertEqual(run.call_args.args[0][-1], item[0])
+        lookup.assert_called_once_with('fixture', True, credited=False)
+        self.assertEqual(run.call_args_list[0].args[0][-1], item[0])
         preview.assert_called_once_with('Spotify', 'play')
         behind.assert_called_once_with('Editor', 'Spotify')
 
     def test_play_reply_names_spotify_once(self):
         item = ('spotify:playlist:' + 'C' * 22, 'Top 100 Pop Tracks on Spotify')
         with patch.object(atticus, 'spotify_item', return_value=item), patch.object(atticus, 'osa', return_value='Editor'), \
-             patch.object(atticus.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, 'playing', '')), \
+             patch.object(atticus.subprocess, 'run', side_effect=spotify('playing\ttrue\tspotify:track:' + 'P' * 22 + '\tA Song In It\tSome Band')), \
              patch.object(atticus, 'preview_app'), patch.object(atticus, 'keep_behind'):
             self.assertEqual(atticus.play('my playlist'), 'Playing Top 100 Pop Tracks on Spotify.')
         self.assertEqual(atticus.label('Bash', {'command': f'{atticus.PLAY} "hits on spotify"'}), 'Playing hits on spotify')
@@ -305,7 +394,7 @@ class SpotifyTests(unittest.TestCase):
                  patch.object(atticus.subprocess, 'run') as run:
                 self.assertIsNone(atticus.fast('play fixture song on spotify'))
                 self.assertEqual(atticus.fast.cmds, [])
-                lookup.assert_called_once_with('fixture song', True)
+                lookup.assert_called_once_with('fixture song', True, credited=False)
                 run.assert_not_called()
 
     def test_play_cli_preserves_lookup_error(self):
@@ -337,8 +426,39 @@ class SpotifyTests(unittest.TestCase):
         self.assertEqual(out.getvalue().strip(), 'Added Fixture song to your Spotify queue.')
         self.assertEqual(atticus.label('Bash', {'command': f'{atticus.QUEUE} "Fixture song"'}),
                          'Adding Fixture song to the queue')
-        self.assertIn(atticus.QUEUE, atticus.SYSTEM)
+        self.assertIn('--queue "<track>" queues', atticus.SYSTEM)
 
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class CatalogTests(unittest.TestCase):
+    """Nov 21, 2026: DuckDuckGo's bot check and Brave's 429 stopped every play; Wikidata keeps Spotify's ids, Apple spells the names."""
+    def lookup(self, said, apple, wiki, rows, credited=False):
+        def get(url, timeout=10, agent=''):
+            if 'itunes' in url: return json.dumps({'results': [apple] if 'entity=song' in url else []})
+            self.assertIn('Atticus/', agent)   # Wikimedia rate-limits clients posing as a browser
+            return json.dumps({'search': wiki} if 'wbsearchentities' in url else {'results': {'bindings': rows}})
+        with patch.object(atticus, 'get', side_effect=get):
+            return atticus.catalog_item(said, credited)
+
+    def row(self, q, kind, ident, by=''):
+        return {'item': {'value': 'http://www.wikidata.org/entity/' + q}, kind: {'value': ident}, **({'by': {'value': by}} if by else {})}
+
+    def test_artist_from_filler_words(self):
+        got = self.lookup('some drake', {'trackName': 'One Dance', 'artistName': 'Drake'},
+                          [{'id': 'Q1', 'label': 'Drake', 'description': 'Canadian rapper'}], [self.row('Q1', 'artist', 'A' * 22)])
+        self.assertEqual(got, ('spotify:artist:' + 'A' * 22, 'Drake'))
+
+    def test_song_by_artist_skips_a_same_named_song_by_someone_else(self):
+        wiki = [{'id': 'Q2', 'label': "God's Plan", 'description': '2002 album by 50 Cent'},
+                {'id': 'Q3', 'label': "God's Plan", 'description': '2018 single by Drake'}]
+        rows = [self.row('Q2', 'album', 'F' * 22), self.row('Q3', 'track', 'D' * 22)]
+        got = self.lookup('gods plan by drake', {'trackName': "God's Plan", 'artistName': 'Drake'}, wiki, rows, credited=True)
+        self.assertEqual(got, ('spotify:track:' + 'D' * 22, 'Gods Plan By Drake'))
+        self.assertIsNone(self.lookup('gods plan by drake', {'trackName': "God's Plan", 'artistName': 'Drake'}, wiki[:1], rows[:1], credited=True))
+
+    def test_credited_bare_name_and_unknown_song_find_nothing(self):
+        self.assertIsNone(self.lookup('minecraft', {}, [{'id': 'Q4', 'label': 'Minecraft'}], [self.row('Q4', 'album', 'M' * 22)], credited=True))
+        self.assertIsNone(self.lookup('janice stfu by drake', {'trackName': 'Janice STFU', 'artistName': 'Drake'}, [{'id': 'Q5', 'label': 'Janice STFU'}], [], credited=True))

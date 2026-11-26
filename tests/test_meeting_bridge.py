@@ -7,11 +7,42 @@ import sys
 import tempfile
 import unittest
 
+from tests import swift_motion
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
 @unittest.skipUnless(sys.platform == 'darwin', 'macOS native meeting bridge')
 class MeetingBridgeTests(unittest.TestCase):
+    def test_pending_javascript_keeps_the_stage_deadline(self):
+        source = Path(__file__).read_text().rsplit('    def test_prep_queue_edits_and_stop_with_fake_workers(self):', 1)[1]
+        start = source.index('Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { _ in')
+        checks = source[start:source.index(' switch stage {', start)].split('\n', 1)[1].replace('\\\\', '\\')
+        swift = '''import Foundation
+struct Meeting { let gathering = false, running = false; let process: Int? = nil }
+let meeting = Meeting(), begun = Date()
+var stage = 0, timedStage = 0, tries = 0, stageStarts: [String] = []
+var stageBegan = Date().addingTimeInterval(CommandLine.arguments[1] == "expired" ? -13 : 0)
+let evaluating = true
+func fail(_ message: String) -> Never { print(message); exit(1) }
+func tick() {
+''' + checks + '''
+ preconditionFailure("Pending JavaScript advanced the stage")
+}
+tick()
+print("pending")
+'''
+        with tempfile.TemporaryDirectory() as root:
+            file = Path(root) / 'deadline.swift'; file.write_text(swift)
+            binary = Path(root) / 'deadline'
+            compiled = subprocess.run(['swiftc', str(file), '-o', str(binary)], text=True, capture_output=True)
+            self.assertEqual(compiled.returncode, 0, compiled.stderr)
+            pending = subprocess.run([str(binary), 'pending'], text=True, capture_output=True, timeout=5)
+            self.assertEqual(pending.returncode, 0, pending.stdout + pending.stderr)
+            expired = subprocess.run([str(binary), 'expired'], text=True, capture_output=True, timeout=5)
+            self.assertEqual(expired.returncode, 1, expired.stdout + expired.stderr)
+            self.assertIn('Bridge test timed out at stage 0', expired.stdout)
+
     def test_prep_queue_edits_and_stop_with_fake_workers(self):
         source = (ROOT / 'Atticus.swift').read_text()
         classes = source[source.index('// Meeting audio'):source.index('// MARK: - Hands')]
@@ -21,7 +52,8 @@ class MeetingBridgeTests(unittest.TestCase):
         classes = classes[:begin] + '        Prefs.set("meetingPrep", "")\n    }\n' + classes[end:]
         # The guest's own Calendar permission must not decide the flow: denied posts allowCalendar (System Settings), unasked prompts.
         classes = classes.replace('EKEventStore.authorizationStatus(for: .event)', 'fixtureCalendar').replace('EKEventStore.authorizationStatus(for:.event)', 'fixtureCalendar')
-        prefs = source[source.index('enum Prefs'):source.index('// Read-aloud uses')] + source[source.index('func callJS('):source.index('func currentRequestScreen(')]
+        prefs = source[source.index('enum Prefs'):source.index('// Read-aloud uses')] + source[source.index('func callJS('):source.index('func currentRequestScreen(')] + 'func telemetry(_ args: [String]) {}\n'
+        prefs += swift_motion(source)
         swift = '''import Cocoa
 import Carbon
 import AVFoundation
@@ -36,7 +68,18 @@ let dir = CommandLine.arguments[1]
 ''' + prefs + '''
 let calendar = EKEventStore(), fixtureCalendar = EKAuthorizationStatus.notDetermined   // Fill in for me offered; no real calendar read
 final class KeyPanel: NSPanel { override var canBecomeKey: Bool { true } }
-final class AppStub { var shortcutDown = false; func close(clear: Bool) {} }
+final class AppStub {
+ var shortcutDown = false, pinned = false, voicePermissionPending = false, voicePermissionID = 0
+ var voicePermissionAction: (() -> Void)?
+ func close(clear: Bool) {}; func dismissUpgrade() {}
+ func pill(_ on: Bool) {}; func show() {}; func js(_ call: String, _ value: Any?) {}
+ func missingVoicePermission(_ need: String, retry: @escaping () -> Void) {}
+}
+final class Onboarding {
+ static func permissionState(_ need: String) -> Int { 1 }
+ func request(_ need: String, settingsOnRefusal: Bool, current: @escaping () -> Bool, done: @escaping (Bool) -> Void) { if current() { done(true) } }
+}
+let onboarding = Onboarding()
 final class BarStub { func paint() {} }
 let app = AppStub(), bar = BarStub()
 final class SettingsStub {
@@ -54,20 +97,23 @@ let meeting = MeetingCopilot()
 meeting.calendarContext = { done in done(["title":"Pilot review","time":"Today at 4:00 PM","attendees":["Dana <dana@example.com>"],"notes":"Agenda"], nil) }
 let nsapp = NSApplication.shared
 nsapp.setActivationPolicy(.accessory)
-var stage = 0, tries = 0, timedStage = 0, stageStarts: [String] = [], savedFrame = NSRect.zero, latencyReady = Date.distantPast
+var stage = 0, tries = 0, timedStage = 0, stageStarts: [String] = [], savedFrame = NSRect.zero, latencyReady = Date.distantPast, stageBegan = Date()
 var cancelledFinishes: [Process] = [], roomCallFolder = ""
+var evaluating = false
 func fail(_ message: String) -> Never { print(message); meeting.discard(); exit(1) }
 func evaluate(_ script: String, _ done: @escaping (Any?) -> Void) {
+ guard !evaluating else { return }; evaluating = true
  meeting.web?.evaluateJavaScript(script) { value, error in
-  if let error { fail(error.localizedDescription) }; done(value)
+  evaluating = false
+  if let error { fail("Stage \\(stage), script \\(script): \\(error)") }; done(value)
  }
 }
 meeting.open(demo: true)
 let begun = Date()
 Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { _ in
- if stage != timedStage { timedStage = stage; tries = 0; stageStarts.append("\\(stage)@\\(String(format: "%.1f", Date().timeIntervalSince(begun)))s") }   // each stage gets its own 12 s: two cold page loads and eight helpers outrun one budget on a loaded guest
- tries += 1
- if tries > 120 { fail("Bridge test timed out at stage \\(stage) after \\(stageStarts.joined(separator: " ")) (gathering \\(meeting.gathering), helper \\(meeting.process != nil), running \\(meeting.running))") }
+ if stage != timedStage { timedStage = stage; stageBegan = Date(); stageStarts.append("\\(stage)@\\(String(format: "%.1f", Date().timeIntervalSince(begun)))s") }   // each stage keeps its 12 s even while JavaScript is pending
+ if Date().timeIntervalSince(stageBegan) > 12 { fail("Bridge test timed out at stage \\(stage) after \\(stageStarts.joined(separator: " ")) (gathering \\(meeting.gathering), helper \\(meeting.process != nil), running \\(meeting.running))") }
+ guard !evaluating else { return }
  switch stage {
  case 0:
   evaluate("!!window.meeting && !document.getElementById('start').disabled") { value in
@@ -281,6 +327,7 @@ nsapp.run()
             html = (ROOT / 'ui/meeting.html').read_text().replace('<script type="module">', '<script type="module">\nawait new Promise(resolve => setTimeout(resolve, 350));')
             (root / 'ui/meeting.html').write_text(html)
             (root / 'ui/orbs.js').write_text((ROOT / 'ui/orbs.js').read_text())
+            (root / 'ui/tokens.css').write_text((ROOT / 'ui/tokens.css').read_text())
             (root / 'worker.py').write_text("import json,sys,time\nfrom pathlib import Path\nif sys.argv[1]=='--meeting-demo-brief':\n print(json.dumps({'brief':'Demo pilot budget: $18,000.'}))\nelif sys.argv[1]=='--meetings':\n time.sleep(30); print('{}')\nelse:\n data=json.load(sys.stdin)\n if sys.argv[1]=='--meeting-gather':\n  Path(sys.argv[0]).with_name('gather.json').write_text(json.dumps(data)); hold=Path(sys.argv[0]).with_name('hold-gather'); end=time.time()+10\n  while hold.exists() and time.time()<end: time.sleep(.05)\n  time.sleep(.3); print(json.dumps({'brief':'[Calendar] Pilot review\\n[Email] Decision'}))\n elif sys.argv[1]=='--meeting-prep':\n  Path(sys.argv[0]).with_name('prep.json').write_text(json.dumps(data)); time.sleep(.7); print(json.dumps({'brief':'Boiled down'}))\n else:\n  Path(sys.argv[0]).with_name('answer.json').write_text(json.dumps(data)); time.sleep(.12); print(json.dumps({'event':'text','text':'Answer','at':time.time()}),flush=True); time.sleep(.38); print(json.dumps({'event':'result','result':{'kind':'answer','lines':['Answer'],'secs':.5,'first_secs':.12}}),flush=True)\n")
             file = root / 'bridge.swift'; file.write_text(swift)
             binary = root / 'bridge'

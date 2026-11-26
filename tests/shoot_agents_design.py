@@ -109,7 +109,7 @@ let box=NSPanel(contentRect:NSRect(x:340,y:300,width:340,height:300),styleMask:[
 let glass=NSVisualEffectView(frame:NSRect(x:0,y:0,width:340,height:300));glass.material = .hudWindow;glass.state = .active;glass.appearance=NSAppearance(named:.darkAqua);glass.wantsLayer=true;glass.layer?.cornerRadius=18;glass.layer?.masksToBounds=true;glass.autoresizingMask=[.width,.height]
 let web=WKWebView(frame:glass.bounds,configuration:config);web.setValue(false,forKey:"drawsBackground");web.autoresizingMask=[.width,.height];glass.addSubview(web);box.contentView=glass;box.orderFrontRegardless()
 let html=try! String(contentsOfFile:dir+"/ui/ui.html",encoding:.utf8),orbs=try! String(contentsOfFile:dir+"/ui/orbs.js",encoding:.utf8)
-web.loadHTMLString(html.replacingOccurrences(of:"/*ORBS*/",with:orbs),baseURL:nil)
+web.loadHTMLString(html.replacingOccurrences(of:"/*TOKENS*/",with:(try? String(contentsOfFile:dir+"/ui/tokens.css",encoding:.utf8)) ?? "").replacingOccurrences(of:"/*ORBS*/",with:orbs),baseURL:nil)
 func after(_ s:Double,_ f:@escaping()->Void){DispatchQueue.main.asyncAfter(deadline:.now()+s,execute:f)}
 func shot(_ name:String,_ done:@escaping()->Void){web.evaluateJavaScript("document.getElementById('card').getBoundingClientRect().height"){value,_ in
  let h=CGFloat((value as? Double) ?? 300);var f=box.frame;f.origin.y=f.maxY-h;f.size.height=h;box.setFrame(f,display:true)
@@ -170,7 +170,7 @@ let bridge=Bridge();app.web.configuration.userContentController.add(bridge,name:
 app.panel.setFrame(NSRect(x:24,y:top-36-330,width:340,height:330),display:true);app.panel.isOpaque=false;app.panel.backgroundColor = .clear;app.panel.level = .floating;app.panel.hasShadow=true
 let glass=NSVisualEffectView(frame:NSRect(x:0,y:0,width:340,height:330));glass.material = .hudWindow;glass.state = .active;glass.appearance=NSAppearance(named:.darkAqua);glass.wantsLayer=true;glass.layer?.cornerRadius=18;glass.layer?.masksToBounds=true
 app.web.frame=glass.bounds;app.web.autoresizingMask=[.width,.height];app.web.setValue(false,forKey:"drawsBackground");glass.addSubview(app.web);app.panel.contentView=glass;app.panel.orderFrontRegardless()
-app.web.loadHTMLString((try! String(contentsOfFile:dir+"/ui/ui.html",encoding:.utf8)).replacingOccurrences(of:"/*ORBS*/",with:try! String(contentsOfFile:dir+"/ui/orbs.js",encoding:.utf8)),baseURL:nil)
+app.web.loadHTMLString((try! String(contentsOfFile:dir+"/ui/ui.html",encoding:.utf8)).replacingOccurrences(of:"/*TOKENS*/",with:(try? String(contentsOfFile:dir+"/ui/tokens.css",encoding:.utf8)) ?? "").replacingOccurrences(of:"/*ORBS*/",with:try! String(contentsOfFile:dir+"/ui/orbs.js",encoding:.utf8)),baseURL:nil)
 let agentsUI=AgentPanels()
 var rows=try! JSONSerialization.jsonObject(with:Data(#"ROWS"#.utf8)) as! [[String:Any]]
 let offer=try! JSONSerialization.jsonObject(with:Data(#"OFFER"#.utf8)) as! [String:Any],offerID=offer["id"] as! String
@@ -280,6 +280,7 @@ nsapp.run()'''
 
 # The setup screens themselves: the real onboarding and Settings pages, with live status sent in like the app does.
 SETUP = r'''setvbuf(stdout,nil,_IONBF,0)
+let agentsUI=AgentPanels()
 let nsapp=NSApplication.shared;nsapp.setActivationPolicy(.accessory)
 let out="OUTDIR",screen=NSScreen.screens[0],top=screen.frame.maxY
 func after(_ s:Double,_ f:@escaping()->Void){DispatchQueue.main.asyncAfter(deadline:.now()+s,execute:f)}
@@ -290,8 +291,9 @@ func page(_ file:String,_ size:NSSize,_ handler:String)->(NSWindow,WKWebView){
  w.titlebarAppearsTransparent=true;w.titleVisibility = .hidden
  let bg=NSVisualEffectView(frame:w.contentRect(forFrameRect:w.frame));bg.material = .underWindowBackground;bg.blendingMode = .behindWindow;bg.state = .active
  let cfg=WKWebViewConfiguration();cfg.userContentController.add(sink,name:handler)
+ if handler=="ob",let arrow=arrowCursorScript(){cfg.userContentController.addUserScript(arrow)}   // as Onboarding.open
  let v=WKWebView(frame:NSRect(x:0,y:0,width:size.width,height:size.height-28),configuration:cfg);v.setValue(false,forKey:"drawsBackground");v.autoresizingMask=[.width,.height]
- let html=(try! String(contentsOfFile:dir+"/ui/"+file,encoding:.utf8)).replacingOccurrences(of:"/*ORBS*/",with:(try? String(contentsOfFile:dir+"/ui/orbs.js",encoding:.utf8)) ?? "")
+ let html=(try! String(contentsOfFile:dir+"/ui/"+file,encoding:.utf8)).replacingOccurrences(of:"/*TOKENS*/",with:(try? String(contentsOfFile:dir+"/ui/tokens.css",encoding:.utf8)) ?? "").replacingOccurrences(of:"/*ORBS*/",with:(try? String(contentsOfFile:dir+"/ui/orbs.js",encoding:.utf8)) ?? "")
  v.loadHTMLString(html,baseURL:nil);bg.addSubview(v);w.contentView=bg;w.orderFrontRegardless();return (w,v)}
 func shoot(_ name:String,_ w:NSWindow){let f=w.frame.insetBy(dx:-24,dy:-24).intersection(screen.frame),p=Process();p.executableURL=URL(fileURLWithPath:"/usr/sbin/screencapture")
  p.arguments=["-x","-R\(Int(f.minX)),\(Int(top-f.maxY)),\(Int(f.width)),\(Int(f.height))",out+"/"+name+".png"];try! p.run();p.waitUntilExit();print("shot \(name)")}
@@ -300,15 +302,9 @@ func ob(_ js:String,_ done:@escaping(Any?)->Void={_ in}){ov.evaluateJavaScript(j
 let some="{mic:true,speech:true,ax:true,screen:false,auto:true,chrome:false,calendar:false,tools:true}"
 var steps:[(Double,()->Void)]=[]
 func run(_ i:Int){guard i<steps.count else{return};after(steps[i].0){steps[i].1();run(i+1)}}
-steps.append((2.0,{ob("ob.plan({ok:true,text:'Signed in. Claude Max.'});ob.set(\(some));document.querySelector('[data-go=\"perms\"]').click()")}))
-steps.append((1.5,{shoot("8-setup-perms",ow);ob("document.querySelector('#perms [data-go=\"agents\"]').click()")}))
-steps.append((0.4,{ob("ob.connectors({connected:['Gmail','Google Drive','Google Calendar','Slack'],signin:['Notion']})")}))
-steps.append((1.4,{shoot("9-setup-agents",ow)
- if !sink.got.contains(where:{($0 as? [String:Any])?["do"] as? String == "connectors"}){print("agents step did not ask for connector status");exit(1)}
- ob("document.getElementById('enable').click();ob.walk('screen')")}))
-steps.append((1.0,{if !sink.got.contains(where:{($0 as? [String:Any])?["do"] as? String == "enableAll"}){print("Enable All did not post");exit(1)};shoot("10-setup-enable-all",ow)
- ob("ob.set({mic:true,speech:true,ax:true,screen:true,auto:true,chrome:true,calendar:true,tools:true});ob.walk('');[document.getElementById('enable').hidden,document.getElementById('agents-next').textContent]"){v in print("all set: \(v ?? "")")}}))
-steps.append((1.2,{shoot("11-setup-agents-done",ow);ob("document.getElementById('agents-next').click()")}))
+steps.append((2.0,{ob("ob.plan({ok:true,text:'Signed in. Claude Max.'});ob.set(\(some));document.querySelector('[data-to=perms]').click()")}))
+steps.append((1.0,{shoot("8-setup-perms",ow);ob("document.querySelector('[data-to=ai]').click()")}))
+steps.append((1.0,{shoot("9-setup-ai",ow);ob("document.querySelector('[data-to=try]').click()")}))
 steps.append((1.2,{shoot("12-setup-try",ow);ow.orderOut(nil)
  let (sw,sv)=page("settings.html",NSSize(width:780,height:560),"st");sw.appearance=NSAppearance(named:.darkAqua)   // as SettingsWindow.open
  after(2.0){sv.evaluateJavaScript("st.tab('account');st.perms({mic:true,speech:true,ax:true,screen:true,auto:true,chrome:false,calendar:false});st.connectors({connected:['Gmail','Google Drive','Google Calendar','Slack','Figma'],signin:['Notion','Canva']});st.walk('calendar');document.getElementById('agentsetup').scrollIntoView({block:'center'})"){_,e in if let e{print("js error \(e)")}}
@@ -321,7 +317,9 @@ def point_fixture():
     source = (ROOT / 'Atticus.swift').read_text()
     cut = lambda start, end: source[source.index(start):source.index(end, source.index(start))]
     return ('import Cocoa\n' + cut('func axAttribute(', '// AX has no public') + 'enum Hands {\n' + cut('    static func attribute(_ e: AXUIElement', '    static func array(') + '}\n'
-            + cut('var ring: NSPanel?', 'func jsonString') + 'enum Onboarding {\n static let name = "Atticus"\n' + cut('    static func pointSwitch(', '    static func bundle(') + '}\n'
+            + 'enum Prefs { static func bool(_ key: String) -> Bool { false } }\n' + cut('func applySharing(', 'func profileName(')
+            + 'var leader: NSPanel?\nfunc lead(from: NSRect, to: NSRect) -> Bool { preconditionFailure("Switch ring has no answer box") }\n'
+            + cut('var ring: NSPanel?', '// A line from the box') + 'enum Onboarding {\n static let name = "Atticus"\n' + cut('    static func pointSwitch(', '    static func bundle(') + '}\n'
             + r'''setvbuf(stdout,nil,_IONBF,0)
 let nsapp=NSApplication.shared;nsapp.setActivationPolicy(.accessory)
 NSWorkspace.shared.open(URL(string:"x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!)
